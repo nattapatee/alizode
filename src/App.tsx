@@ -1,0 +1,519 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { WorkspaceTabs } from "./components/workspace-tabs/WorkspaceTabs";
+import { LaneList } from "./components/lane-list/LaneList";
+import { LaneView } from "./components/lane-view/LaneView";
+import { LibraryView } from "./components/library-view/LibraryView";
+import { EditorView } from "./components/editor-view/EditorView";
+import { CommandBar } from "./components/command-bar/CommandBar";
+import { StatusBar } from "./components/status-bar/StatusBar";
+import { PermissionModal } from "./components/permission-modal/PermissionModal";
+import { FsWriteModal } from "./components/fs-write-modal/FsWriteModal";
+import { PeerToast } from "./components/peer-toast/PeerToast";
+import { Onboarding } from "./components/onboarding/Onboarding";
+import { Stage } from "./components/stage/Stage";
+import { WorkspaceIntro } from "./components/workspace-intro/WorkspaceIntro";
+import { ModelPicker } from "./components/model-picker/ModelPicker";
+import { ConfigPicker } from "./components/config-picker/ConfigPicker";
+import type { AcpConfigOption } from "./lib/acp-types";
+import { SessionPicker } from "./components/session-picker/SessionPicker";
+import { AgentPicker } from "./components/agent-picker/AgentPicker";
+import { CHAR_BY_ID } from "./lib/characters";
+import { useWorkspace } from "./hooks/useWorkspace";
+import { useLaneStream } from "./hooks/useLaneStream";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+
+export default function App() {
+  const {
+    workspaces,
+    activeWorkspace,
+    activeWorkspaceId,
+    setActiveWorkspaceId,
+    lanes,
+    activeLane,
+    activeLaneId,
+    setActiveLaneId,
+    activeClient,
+    getClient,
+    getOrSpawnClient,
+    createWorkspace,
+    createLane,
+    deleteLane,
+    deleteWorkspace,
+    renameWorkspace,
+    updateWorkspaceCwd,
+    refreshLanes,
+  } = useWorkspace();
+
+  const handleDrainAction = useCallback(
+    async (action: { lane_id: string; prompt_text: string }) => {
+      const drainClient = await getOrSpawnClient(action.lane_id);
+      if (drainClient) {
+        drainClient.prompt([{ type: "text", text: action.prompt_text }]).catch(() => {});
+      }
+    },
+    [getOrSpawnClient],
+  );
+
+  const { events, addUserInput, addSystemEvent, clearEvents, isLoading } = useLaneStream(activeLaneId, activeWorkspaceId, activeClient, handleDrainAction);
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [showSessionPicker, setShowSessionPicker] = useState(false);
+  const [configPickerOption, setConfigPickerOption] = useState<AcpConfigOption | null>(null);
+  const [libraryWorkspaces, setLibraryWorkspaces] = useState<Set<string>>(new Set());
+  const [editorWorkspaces, setEditorWorkspaces] = useState<Set<string>>(new Set());
+  const [introShown, setIntroShown] = useState<Set<string>>(new Set());
+  const [showCreateMenu, setShowCreateMenu] = useState(false);
+  const [showAgentPicker, setShowAgentPicker] = useState(false);
+
+  const isLibrary = activeWorkspaceId ? libraryWorkspaces.has(activeWorkspaceId) : false;
+  const isEditor = activeWorkspaceId ? editorWorkspaces.has(activeWorkspaceId) : false;
+
+  const handleSessionResume = useCallback(
+    async (sessionId: string) => {
+      if (!activeClient) return;
+      try {
+        await activeClient.resumeSession(sessionId);
+        addSystemEvent(`resumed session ${sessionId.slice(0, 8)}…`);
+      } catch (err) {
+        addSystemEvent(`resume failed: ${err}`);
+      }
+    },
+    [activeClient, addSystemEvent],
+  );
+
+  const handleSessionLoad = useCallback(
+    async (sessionId: string) => {
+      if (!activeClient) return;
+      try {
+        await activeClient.loadSession(sessionId);
+        addSystemEvent(`loaded session ${sessionId.slice(0, 8)}… (read-only)`);
+      } catch (err) {
+        addSystemEvent(`load failed: ${err}`);
+      }
+    },
+    [activeClient, addSystemEvent],
+  );
+
+  const handleModelSelect = useCallback(
+    async (model: string) => {
+      if (!activeLaneId || !activeWorkspaceId) return;
+      await invoke("lane_update_model", { workspaceId: activeWorkspaceId, laneId: activeLaneId, model });
+      addSystemEvent(`model → ${model}`);
+      await refreshLanes();
+    },
+    [activeLaneId, activeWorkspaceId, addSystemEvent, refreshLanes],
+  );
+
+  const handleConfigOptionSelect = useCallback(
+    async (configId: string, value: string) => {
+      if (!activeClient) return;
+      try {
+        await activeClient.setConfigOption(configId, value);
+        addSystemEvent(`${configId} → ${value}`);
+      } catch (err) {
+        addSystemEvent(`config error: ${err}`);
+      }
+    },
+    [activeClient, addSystemEvent],
+  );
+
+  const handleCreateWorkspace = useCallback(() => {
+    setShowCreateMenu(true);
+  }, []);
+
+  const handleCreateAgentWorkspace = useCallback(() => {
+    setShowCreateMenu(false);
+    setShowAgentPicker(true);
+  }, []);
+
+  const pendingAgentRef = useRef<string | null>(null);
+
+  const handleAgentPicked = useCallback(async (agentId: string) => {
+    setShowAgentPicker(false);
+    pendingAgentRef.current = agentId;
+    const name = `workspace-${workspaces.length + 1}`;
+    await createWorkspace(name, "~");
+  }, [workspaces.length, createWorkspace]);
+
+  useEffect(() => {
+    if (!pendingAgentRef.current || !activeWorkspaceId) return;
+    const agent = pendingAgentRef.current;
+    pendingAgentRef.current = null;
+    createLane(agent, "sonnet");
+  }, [activeWorkspaceId, createLane]);
+
+  const handleCreateLibrary = useCallback(async () => {
+    setShowCreateMenu(false);
+    const ws = await createWorkspace("library", "");
+    setLibraryWorkspaces((prev) => new Set([...prev, ws.id]));
+  }, [createWorkspace]);
+
+  const handleCreateEditor = useCallback(async () => {
+    setShowCreateMenu(false);
+    const ws = await createWorkspace("ide", "");
+    setEditorWorkspaces((prev) => new Set([...prev, ws.id]));
+  }, [createWorkspace]);
+
+  const handleLibraryFolderSelect = useCallback(
+    async (path: string) => {
+      if (!activeWorkspaceId) return;
+      const folderName = path.split("/").pop() ?? "library";
+      await updateWorkspaceCwd(activeWorkspaceId, path);
+      await renameWorkspace(activeWorkspaceId, folderName);
+    },
+    [activeWorkspaceId, updateWorkspaceCwd, renameWorkspace],
+  );
+
+  const handleEditorFolderSelect = useCallback(
+    async (path: string) => {
+      if (!activeWorkspaceId) return;
+      const folderName = path.split("/").pop() ?? "project";
+      await updateWorkspaceCwd(activeWorkspaceId, path);
+      await renameWorkspace(activeWorkspaceId, folderName);
+    },
+    [activeWorkspaceId, updateWorkspaceCwd, renameWorkspace],
+  );
+
+  const handleOnboardingComplete = useCallback(
+    async (name: string, cwd: string) => {
+      await createWorkspace(name, cwd);
+    },
+    [createWorkspace],
+  );
+
+  const handleCloseWorkspace = useCallback(
+    async (id: string) => {
+      await deleteWorkspace(id);
+    },
+    [deleteWorkspace],
+  );
+
+  const handleSelectFolder = useCallback(
+    async (workspaceId: string) => {
+      const selected = await open({ directory: true, multiple: false });
+      if (selected) {
+        await updateWorkspaceCwd(workspaceId, selected);
+      }
+    },
+    [updateWorkspaceCwd],
+  );
+
+  const handleCreateLane = useCallback(
+    async (agentKind: string, model: string) => {
+      await createLane(agentKind, model);
+    },
+    [createLane],
+  );
+
+  const handleDeleteLane = useCallback(
+    async (id: string) => {
+      await deleteLane(id);
+    },
+    [deleteLane],
+  );
+
+  const handleCommand = useCallback(
+    async (text: string) => {
+      if (!activeLaneId) return;
+
+      if (text.startsWith("@")) {
+        const spaceIdx = text.indexOf(" ");
+        if (spaceIdx > 1) {
+          const mentionedLane = text.slice(1, spaceIdx);
+          const message = text.slice(spaceIdx + 1).trim();
+          const target = lanes.find((l) => l.id === mentionedLane);
+          if (target && message) {
+            addSystemEvent(`→ @${mentionedLane}: ${message}`);
+            try {
+              const result = await invoke<{
+                delivered: boolean;
+                drain?: { lane_id: string; prompt_text: string } | null;
+                error?: string | null;
+              }>("inter_lane_deliver", {
+                fromLaneId: activeLaneId,
+                toLaneId: target.id,
+                message,
+                done: false,
+              });
+              if (result.drain) {
+                const drainClient = await getOrSpawnClient(result.drain.lane_id);
+                if (drainClient) {
+                  drainClient.prompt([{ type: "text", text: result.drain.prompt_text }]).catch(() => {});
+                }
+              }
+              if (result.error) {
+                addSystemEvent(`peer error: ${result.error}`);
+              }
+            } catch (err) {
+              addSystemEvent(`peer error: ${err}`);
+            }
+            return;
+          }
+        }
+      }
+
+      if (text.startsWith("/")) {
+        const parts = text.slice(1).split(/\s+/);
+        const cmd = parts[0].toLowerCase();
+
+        switch (cmd) {
+          case "clear":
+            clearEvents();
+            return;
+          case "model": {
+            const modelOpt = activeClient?.getConfigOption("model");
+            if (modelOpt) {
+              setConfigPickerOption(modelOpt);
+            } else {
+              setShowModelPicker(true);
+            }
+            return;
+          }
+          case "effort": {
+            const effortOpt = activeClient?.getConfigOption("effort");
+            if (effortOpt) {
+              setConfigPickerOption(effortOpt);
+            } else {
+              addSystemEvent("effort config not available for this backend");
+            }
+            return;
+          }
+          case "mode": {
+            const modeOpt = activeClient?.getConfigOption("mode");
+            if (modeOpt) {
+              setConfigPickerOption(modeOpt);
+            } else {
+              addSystemEvent("mode config not available for this backend");
+            }
+            return;
+          }
+          case "sessions":
+          case "resume":
+            if (!activeClient) {
+              addSystemEvent("no active agent — spawn one first");
+              return;
+            }
+            setShowSessionPicker(true);
+            return;
+          case "stop":
+            if (!activeWorkspaceId) return;
+            await invoke("lane_stop", { workspaceId: activeWorkspaceId, laneId: activeLaneId });
+            addSystemEvent("lane stopped");
+            return;
+          case "cancel":
+            if (activeClient) {
+              await activeClient.cancel();
+              addSystemEvent("cancelled");
+            }
+            return;
+          case "export":
+            if (!activeWorkspaceId) return;
+            try {
+              const jsonl = await invoke<string>("lane_export_session", {
+                workspaceId: activeWorkspaceId,
+                laneId: activeLaneId,
+              });
+              await navigator.clipboard.writeText(jsonl);
+              addSystemEvent(`exported ${jsonl.split("\n").length} events to clipboard`);
+            } catch (err) {
+              addSystemEvent(`export failed: ${err}`);
+            }
+            return;
+          case "help":
+            addSystemEvent(
+              "/model — pick model\n/effort — set effort level\n/mode — set permission mode\n/sessions — browse sessions\n/resume — resume a session\n/clear — clear display\n/stop — stop lane\n/cancel — cancel turn\n/export — copy session JSONL\n@lane-id msg — send to lane\nCmd+T — new lane\nCmd+W — close lane\nCmd+[/] — switch lanes\nEsc — cancel",
+            );
+            return;
+          default:
+            addSystemEvent(`unknown command: /${cmd}`);
+            return;
+        }
+      }
+
+      addUserInput(text);
+      try {
+        const client = await getOrSpawnClient(activeLaneId);
+        if (client) {
+          await invoke("inter_lane_set_status", { laneId: activeLaneId, status: "busy" }).catch(() => {});
+          await client.prompt([{ type: 'text', text }]);
+        } else {
+          addSystemEvent("error: could not spawn agent");
+        }
+      } catch (err) {
+        addSystemEvent(`prompt error: ${err}`);
+      }
+    },
+    [activeLaneId, activeWorkspaceId, activeClient, lanes, addUserInput, addSystemEvent, clearEvents, getClient, getOrSpawnClient],
+  );
+
+  const keyboardActions = useMemo(
+    () => ({
+      createLane: () => handleCreateLane("claude", "sonnet"),
+      deleteLane: () => {
+        if (activeLaneId) handleDeleteLane(activeLaneId);
+      },
+      prevLane: () => {
+        if (!activeLaneId || lanes.length < 2) return;
+        const idx = lanes.findIndex((l) => l.id === activeLaneId);
+        const prev = idx > 0 ? lanes[idx - 1] : lanes[lanes.length - 1];
+        setActiveLaneId(prev.id);
+      },
+      nextLane: () => {
+        if (!activeLaneId || lanes.length < 2) return;
+        const idx = lanes.findIndex((l) => l.id === activeLaneId);
+        const next = idx < lanes.length - 1 ? lanes[idx + 1] : lanes[0];
+        setActiveLaneId(next.id);
+      },
+      cancelLane: () => {
+        if (activeClient) {
+          activeClient.cancel();
+        }
+      },
+    }),
+    [activeLaneId, activeClient, lanes, handleCreateLane, handleDeleteLane, setActiveLaneId],
+  );
+
+  useKeyboardShortcuts(keyboardActions);
+
+  if (workspaces.length === 0) {
+    return <Onboarding onComplete={handleOnboardingComplete} />;
+  }
+
+  return (
+    <div className="term-root">
+      <div className="scanlines subtle" />
+      <div className="crt-glow" />
+
+      <WorkspaceTabs
+        workspaces={workspaces}
+        activeId={activeWorkspaceId}
+        libraryIds={libraryWorkspaces}
+        editorIds={editorWorkspaces}
+        onSelect={setActiveWorkspaceId}
+        onCreate={handleCreateWorkspace}
+        onClose={handleCloseWorkspace}
+        onRename={renameWorkspace}
+        onSelectFolder={handleSelectFolder}
+      />
+
+      {isEditor && activeWorkspace ? (
+        <EditorView rootPath={activeWorkspace.cwd} onSelectFolder={handleEditorFolderSelect} />
+      ) : isLibrary && activeWorkspace ? (
+        <LibraryView rootPath={activeWorkspace.cwd} onSelectFolder={handleLibraryFolderSelect} />
+      ) : (
+        <div className="term-body">
+          {activeWorkspaceId && !introShown.has(activeWorkspaceId) && (() => {
+            const introChar = activeLane ? CHAR_BY_ID[activeLane.agent_kind] : null;
+            return (
+              <WorkspaceIntro
+                workspaceName={activeWorkspace?.name ?? "workspace"}
+                charName={introChar?.name ?? "AGENT"}
+                accent={introChar?.accent ?? "var(--cyan)"}
+                onDone={() => setIntroShown((prev) => new Set([...prev, activeWorkspaceId!]))}
+              />
+            );
+          })()}
+          <LaneList
+            lanes={lanes}
+            activeId={activeLaneId}
+            onSelect={setActiveLaneId}
+            onCreate={handleCreateLane}
+            onDelete={handleDeleteLane}
+          />
+          <main className="chat">
+            <LaneView
+              lane={activeLane}
+              events={events}
+              isLoading={isLoading}
+              isStreaming={
+                activeLane?.status === "Running" &&
+                events.length > 0 &&
+                events[events.length - 1].kind === "AgentText"
+              }
+            />
+            <CommandBar
+              laneId={activeLaneId}
+              laneStatus={activeLane?.status}
+              lanes={lanes}
+              onSubmit={handleCommand}
+            />
+          </main>
+          <Stage
+            lane={activeLane}
+            eventCount={events.length}
+            isStreaming={
+              activeLane?.status === "Running" &&
+              events.length > 0 &&
+              events[events.length - 1].kind === "AgentText"
+            }
+            lanes={lanes}
+            onSelectLane={setActiveLaneId}
+          />
+        </div>
+      )}
+
+      <StatusBar workspace={activeWorkspace} lanes={lanes} />
+      <PermissionModal client={activeClient} />
+      <FsWriteModal client={activeClient} />
+      <PeerToast />
+      {showModelPicker && (
+        <ModelPicker
+          currentModel={activeLane?.model ?? ""}
+          onSelect={handleModelSelect}
+          onClose={() => setShowModelPicker(false)}
+        />
+      )}
+      {configPickerOption && (
+        <ConfigPicker
+          option={configPickerOption}
+          onSelect={handleConfigOptionSelect}
+          onClose={() => setConfigPickerOption(null)}
+        />
+      )}
+      {showSessionPicker && activeClient && (
+        <SessionPicker
+          client={activeClient}
+          cwd={activeWorkspace?.cwd ?? "."}
+          onResume={handleSessionResume}
+          onLoad={handleSessionLoad}
+          onClose={() => setShowSessionPicker(false)}
+        />
+      )}
+      {showAgentPicker && (
+        <AgentPicker
+          onSelect={handleAgentPicked}
+          onCancel={() => setShowAgentPicker(false)}
+        />
+      )}
+      {showCreateMenu && (
+        <div className="newtab-overlay" onClick={() => setShowCreateMenu(false)}>
+          <div className="newtab-menu" onClick={(e) => e.stopPropagation()}>
+            <div className="newtab-menu-head">open new</div>
+            <button className="newtab-opt" onClick={handleCreateAgentWorkspace}>
+              <span className="opt-glyph">›_</span>
+              <span className="opt-meta">
+                <span className="opt-name">workspace</span>
+                <span className="opt-sub">terminal · agent lanes · chat</span>
+              </span>
+            </button>
+            <button className="newtab-opt" onClick={handleCreateLibrary}>
+              <span className="opt-glyph">▤</span>
+              <span className="opt-meta">
+                <span className="opt-name">library</span>
+                <span className="opt-sub">browse · group · preview .md</span>
+              </span>
+            </button>
+            <button className="newtab-opt" onClick={handleCreateEditor}>
+              <span className="opt-glyph">⌬</span>
+              <span className="opt-meta">
+                <span className="opt-name">ide</span>
+                <span className="opt-sub">file tree · code · forge chat</span>
+              </span>
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "alizode-mcp": {
+      "type": "stdio",
+      "command": "./src-tauri/target/debug/alizode-mcp",
+      "args": []
+    }
+  }
+}

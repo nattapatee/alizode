@@ -1,0 +1,31 @@
+:root {
+  --bg-0: #07101f;
+  --bg-1: #0c1830;
+  --bg-2: #142546;
+  --bg-3: #1d3565;
+  --border: #2b4a82;
+  --border-soft: #1b3160;
+
+  --ink: #d8e7ff;
+  --ink-dim: #7a96c8;
+  --ink-faint: #4a6594;
+
+  --cyan: #5af0c8;
+  --cyan-bright: #7df9ff;
+  --magenta: #d678ff;
+  --orange: #ff9d3f;
+  --pink: #ff79c6;
+  --yellow: #ffe066;
+  --green: #8af26b;
+  --red: #ff6b8b;
+
+  --accent: var(--cyan);
+  --accent-soft: #9efce0;
+
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --pix: "VT323", "JetBrains Mono", monospace;
+
+  --duration-fast: 150ms;
+  --duration-normal: 300ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
