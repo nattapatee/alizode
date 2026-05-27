@@ -7,16 +7,19 @@ interface Props {
   lane: Lane | null;
   eventCount: number;
   isStreaming?: boolean;
+  activeThought?: string;
   lanes: Lane[];
   onSelectLane: (id: string) => void;
 }
 
-function stageStatus(s: string, streaming: boolean): string {
+function stageStatus(s: string, streaming: boolean, reasoning: boolean): string {
+  if (reasoning) return "thinking";
   if (s === "Running") return streaming ? "talking" : "thinking";
   return "idle";
 }
 
-function statusLabel(s: string, streaming: boolean): string {
+function statusLabel(s: string, streaming: boolean, reasoning: boolean): string {
+  if (reasoning) return "REASONING";
   if (s === "Running") return streaming ? "TRANSMITTING" : "PROCESSING";
   if (s === "Waiting") return "AWAITING INPUT";
   if (s === "Error") return "ERROR";
@@ -24,36 +27,37 @@ function statusLabel(s: string, streaming: boolean): string {
   return "IDLE · STANDBY";
 }
 
-export function Stage({ lane, eventCount, isStreaming = false, lanes, onSelectLane }: Props) {
+export function Stage({
+  lane,
+  eventCount,
+  isStreaming = false,
+  activeThought = "",
+  lanes,
+  onSelectLane,
+}: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    if (lane?.status === "Running") {
+    if (lane?.status === "Running" || activeThought.length > 0) {
       v.playbackRate = isStreaming ? 2 : 1.2;
     } else {
       v.playbackRate = 0.7;
     }
     v.play().catch(() => {});
-  }, [lane?.status, isStreaming]);
+  }, [lane?.status, isStreaming, activeThought]);
 
   if (!lane) {
-    return (
-      <aside className="stage">
-        <div className="stage-head">
-          <span>AGENT_PORTAL</span>
-          <span className="stage-id">#—</span>
-        </div>
-      </aside>
-    );
+    return <div className="stage" />;
   }
 
   const char = CHAR_BY_ID[lane.agent_kind];
-  const cssStatus = stageStatus(lane.status, isStreaming);
+  const reasoning = activeThought.length > 0;
+  const cssStatus = stageStatus(lane.status, isStreaming, reasoning);
 
   return (
-    <aside
+    <div
       className="stage"
       style={
         char
@@ -61,11 +65,6 @@ export function Stage({ lane, eventCount, isStreaming = false, lanes, onSelectLa
           : undefined
       }
     >
-      <div className="stage-head">
-        <span>AGENT_PORTAL</span>
-        <span className="stage-id">#{lane.agent_kind}</span>
-      </div>
-
       <div className={`stage-frame status-${cssStatus}`}>
         <div className="stage-grid" />
         <div className="stage-scanring" />
@@ -100,7 +99,7 @@ export function Stage({ lane, eventCount, isStreaming = false, lanes, onSelectLa
 
         <div className="stage-state">
           <span className={`sdot status-${cssStatus}`} />
-          {statusLabel(lane.status, isStreaming)}
+          {statusLabel(lane.status, isStreaming, reasoning)}
         </div>
       </div>
 
@@ -126,9 +125,17 @@ export function Stage({ lane, eventCount, isStreaming = false, lanes, onSelectLa
           <span className="stat-k">ctx</span>
           <span className="stat-v">{eventCount} events</span>
         </div>
-        <div className="stat">
-          <span className="stat-k">status</span>
-          <span className="stat-v">{lane.status.toLowerCase()}</span>
+        <div className="stage-thought-wrap">
+          <div className="stage-thought-head">
+            <span className="stat-k">thought</span>
+            {reasoning && <span className="stage-thought-pulse" />}
+          </div>
+          <div
+            className={`stage-thought${reasoning ? " stage-thought-live" : ""}`}
+            aria-live="polite"
+          >
+            {activeThought || "\u00a0"}
+          </div>
         </div>
       </div>
 
@@ -146,6 +153,6 @@ export function Stage({ lane, eventCount, isStreaming = false, lanes, onSelectLa
           onSelectLane={onSelectLane}
         />
       </div>
-    </aside>
+    </div>
   );
 }

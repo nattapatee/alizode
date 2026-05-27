@@ -5,6 +5,7 @@
 // session. The Rust side acts as JSON-RPC client AND handles inbound requests
 // (fs/read_text_file, fs/write_text_file, session/request_permission).
 
+use log::{debug, info, warn};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -50,11 +51,8 @@ fn builtin_backends() -> Vec<(&'static str, AcpBackend)> {
         (
             "codex",
             AcpBackend {
-                command: "npx".to_string(),
-                args: vec![
-                    "-y".to_string(),
-                    "@agentclientprotocol/codex-acp".to_string(),
-                ],
+                command: "codex-acp".to_string(),
+                args: vec![],
                 display_name: "Codex".to_string(),
             },
         ),
@@ -132,6 +130,10 @@ pub(crate) fn cached_login_env() -> &'static HashMap<String, String> {
     })
 }
 
+#[tauri::command]
+pub async fn acp_login_env() -> Result<HashMap<String, String>, String> {
+    Ok(cached_login_env().clone())
+}
 
 
 // ─── Public types exposed to the frontend ──────────────────────────
@@ -330,7 +332,10 @@ where
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
-            Ok(0) => break,
+            Ok(0) => {
+                info!("[acp:{}] subprocess stdout closed", client.alizode_session);
+                break;
+            }
             Ok(_) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -338,11 +343,21 @@ where
                 }
                 let value: Value = match serde_json::from_str(trimmed) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(err) => {
+                        debug!(
+                            "[acp:{}] dropping non-JSON line ({err}): {}",
+                            client.alizode_session,
+                            &trimmed[..trimmed.len().min(200)]
+                        );
+                        continue;
+                    }
                 };
                 dispatch_message(&client, &app, value).await;
             }
-            Err(_) => break,
+            Err(err) => {
+                warn!("[acp:{}] read error: {err}", client.alizode_session);
+                break;
+            }
         }
     }
     finalize_disconnect(&client, &app).await;
@@ -373,6 +388,8 @@ async fn dispatch_message(client: &Arc<AcpClient>, app: &AppHandle, value: Value
         let mut pending = client.pending.lock().await;
         if let Some(tx) = pending.remove(&id) {
             let _ = tx.send(value);
+        } else {
+            debug!("[acp:{}] response for unknown id {id}", client.alizode_session);
         }
         return;
     }
@@ -385,6 +402,8 @@ async fn dispatch_message(client: &Arc<AcpClient>, app: &AppHandle, value: Value
             .to_string();
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         handle_notification(client, app, &method, params);
+    } else {
+        debug!("[acp:{}] dropping malformed message", client.alizode_session);
     }
 }
 
@@ -485,6 +504,7 @@ async fn handle_inbound_request(
                     Ok(json!({ "content": content }))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!("[acp:{}] fs/read_text_file: not found, returning empty", client.alizode_session);
                     emit_fs_activity(&client, &app, "read", &path, true, None);
                     Ok(json!({ "content": "" }))
                 }
@@ -593,13 +613,14 @@ async fn handle_inbound_request(
                 }
             }
         }
-        _ => {
+        other => {
+            debug!("[acp:{}] unknown inbound method: {other}", client.alizode_session);
             let _ = client
                 .reply(
                     id,
                     Err(json!({
                         "code": -32601,
-                        "message": format!("Method not found: {method}")
+                        "message": format!("Method not found: {other}")
                     })),
                 )
                 .await;
@@ -635,10 +656,20 @@ fn handle_notification(
                         }),
                     );
                 }
-                _ => {}
+                other => {
+                    debug!(
+                        "[acp:{}] dropping session/update kind {other}",
+                        client.alizode_session
+                    );
+                }
             }
         }
-        _ => {}
+        other => {
+            debug!(
+                "[acp:{}] dropping notification {other}",
+                client.alizode_session
+            );
+        }
     }
 }
 
@@ -678,7 +709,10 @@ where
         line.clear();
         match reader.read_line(&mut line).await {
             Ok(0) => break,
-            Ok(_) => client.append_stderr(&line).await,
+            Ok(_) => {
+                debug!("[acp:{}] stderr: {}", client.alizode_session, line.trim_end());
+                client.append_stderr(&line).await;
+            }
             Err(_) => break,
         }
     }
@@ -1012,7 +1046,7 @@ pub async fn acp_session_list(
     client.request("session/list", Value::Object(params)).await
 }
 
-const OPENCODE_DEFAULT_MODEL: &str = "sonnet";
+const OPENCODE_DEFAULT_MODEL: &str = "kimi 2.6 max";
 
 async fn set_opencode_default_model(
     client: &AcpClient,

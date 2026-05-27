@@ -89,23 +89,6 @@ function ToolResultRow({ event }: Props) {
   );
 }
 
-function ThoughtRow({ event }: Props) {
-  const text = getEventText(event);
-  const lineCount = text.split("\n").length;
-  return (
-    <details className="log-details">
-      <summary className="log-row thought">
-        <span className="log-t" />
-        <span className="log-prefix">thought</span>
-        <span className="log-text log-dim">
-          {lineCount} {lineCount === 1 ? "line" : "lines"}
-        </span>
-      </summary>
-      <pre className="log-expand thought">{text}</pre>
-    </details>
-  );
-}
-
 function PeerRow({ event }: Props) {
   const { fromLane, toLane, text, isReview } = getPeerInfo(event);
   const isIn = event.kind === "PeerIn";
@@ -183,7 +166,7 @@ export function EventRow({ event }: Props) {
     case "ToolResult":
       return <ToolResultRow event={event} />;
     case "Thought":
-      return <ThoughtRow event={event} />;
+      return null;
     case "PeerIn":
     case "PeerOut":
       return <PeerRow event={event} />;

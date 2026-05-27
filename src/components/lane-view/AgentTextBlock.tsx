@@ -4,8 +4,25 @@ import {
   parser,
   parser_write,
   parser_end,
+  HREF,
+  SRC,
   type Parser,
+  type Default_Renderer,
 } from "streaming-markdown";
+
+function makeSafeRenderer(root: HTMLElement): Default_Renderer {
+  const r = default_renderer(root);
+  const origSetAttr = r.set_attr;
+  r.set_attr = (data, type, value) => {
+    if (type === HREF && !/^(https?|mailto):/i.test(value)) {
+      value = "#";
+    } else if (type === SRC && !/^https?:/i.test(value)) {
+      value = "#";
+    }
+    origSetAttr(data, type, value);
+  };
+  return r;
+}
 
 interface AgentTextBlockProps {
   chunks: string[];
@@ -21,7 +38,7 @@ export function AgentTextBlock({ chunks, isSealed }: AgentTextBlockProps) {
     const el = containerRef.current;
     if (!el) return;
     el.innerHTML = "";
-    const r = default_renderer(el);
+    const r = makeSafeRenderer(el);
     const p = parser(r);
     parserRef.current = p;
     fedRef.current = 0;

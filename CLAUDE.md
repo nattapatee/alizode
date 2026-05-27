@@ -43,14 +43,16 @@ Agents spawn via ACP (Agent Client Protocol) JSON-RPC over stdio. Each lane gets
 
 **Supported backends** (configured in `core/acp.rs::default_backends()`):
 
-| Backend | Command |
-|---------|---------|
-| Claude | `npx -y @agentclientprotocol/claude-agent-acp` |
-| Codex | `npx -y @agentclientprotocol/codex-acp` |
-| Gemini | `gemini --experimental-acp` |
-| OpenCode | `opencode acp` |
-| Pi | `pi-acp` |
-| Droid | `droid exec --acp` |
+| Backend | Command | Install |
+|---------|---------|---------|
+| Claude | `npx -y @agentclientprotocol/claude-agent-acp` | auto via npx |
+| Codex | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp` |
+| Gemini | `antigravity --experimental-acp` | `npm i -g @anthropic-ai/antigravity` |
+| OpenCode | `opencode acp` | `go install github.com/opencode-ai/opencode@latest` |
+| Pi | `pi-acp` | `npm i -g pi-acp` |
+| Droid | `droid exec --acp` | see droid docs |
+
+All backends except Claude expect the binary on `PATH` (global install). Claude uses `npx -y` because its adapter is rarely installed globally.
 
 **Runtime config options**: Backends that support `session/set_config_option` (e.g., Claude) expose config options (model, effort, mode) from `session/new`. These are stored on `AcpClient.configOptions` and changed via `AcpClient.setConfigOption()` → Tauri `acp_set_config_option` command → JSON-RPC `session/set_config_option`. Frontend slash commands `/model`, `/effort`, `/mode` open the `ConfigPicker` with the relevant option.
 
@@ -83,7 +85,8 @@ React 19 + Tailwind + Vite. Single-page app with workspace tabs (double-click to
 
 Key hooks:
 - `useWorkspace` — workspace/lane CRUD, ACP client management (`getOrSpawnClient`), workspace rename
-- `useLaneStream` — per-lane event Map with epoch guards, DB hydration, stale-handler prevention
+- `useLaneStream` — per-lane event Map with epoch guards, DB hydration, stale-handler prevention. Forwards drain actions from active lane stop events.
+- `useHarnessCoordinator` — listens for harness MCP events (`acp-inter-lane-message`, `acp-peer-list-requested`, `acp-review-requested`), routes them through `inter_lane_deliver`, and executes `drainPromptCycle` to auto-prompt target lanes with peer messages. This is the glue between the MCP tool layer and the coordinator.
 
 Key components:
 - `WorkspaceTabs` — workspace tab bar with inline rename (double-click)
@@ -105,7 +108,35 @@ Key components:
 
 Alizode's architecture is informed by `/Users/tee/src/krypton`, an Electron-based ACP harness. See `IMPROVEMENT_PLAN.md` for the phased adoption roadmap.
 
-### Key Krypton files to study
+### Research workflow: Krypton docs first
+
+**When debugging or improving harness/chat view features, ALWAYS read the relevant Krypton doc BEFORE attempting a fix.** Krypton has 106 design specs in `/Users/tee/src/krypton/docs/` covering edge cases and architectural decisions that are not obvious from code alone. Fixing without reading the spec leads to incomplete solutions.
+
+Workflow: identify the feature area → find the matching Krypton spec → read it → then implement.
+
+### Key Krypton docs by feature area
+
+| Feature area | Krypton spec | Key content |
+|-------------|-------------|-------------|
+| Harness view architecture | `docs/72-acp-harness-view.md` | Full harness spec: auto-allow, permissions, lane lifecycle |
+| Inter-lane messaging | `docs/106-inter-lane-messaging.md` | Drain-on-idle, enqueueSystemPrompt, awaiting_peer, LaneBus/LaneInbox |
+| Soft awaiting peer | `docs/116-soft-awaiting-peer.md` | awaiting_peer treated like idle for submit/drain |
+| MCP server injection | `docs/83-acp-shared-mcp-config.md` | Claude skip, capability gating, C1 split design |
+| MCP harness memory | `docs/73-acp-harness-mcp-memory.md` | HTTP MCP endpoint design, memory tools |
+| Mention fan-out | `docs/115-mention-fanout.md` | @mention parsing, multi-target delivery |
+| Transcript window | `docs/103-acp-harness-transcript-window.md` | Tail-window rendering, row cap |
+| Transcript readability | `docs/107-acp-harness-transcript-readability.md` | Text formatting, display |
+| Streaming markdown | `docs/117-streaming-markdown.md` | streaming-markdown package, per-lane parser |
+| Streaming performance | `docs/114-acp-harness-streaming-perf.md` | Render perf, batching |
+| Session resume | `docs/97-acp-harness-session-resume.md` | JSONL session persistence, resume flow |
+| Review lane mode | `docs/112-acp-review-lane-mode.md` | Code review via peer lanes |
+| Lane picker | `docs/92-acp-lane-picker.md` | Lane creation/selection UI |
+| FS diff preview | `docs/89-acp-diff-preview.md` | File write review modal |
+| Plan tracking | `docs/90-acp-plan-tracking.md` | ACP plan entries display |
+| Right rail | `docs/111-harness-right-rail.md` | Stage/peer bus panel |
+| Agent support | `docs/69-acp-agent-support.md` | ACP window for Claude, Gemini, Codex, OpenCode |
+
+### Key Krypton source files
 
 | Pattern | Krypton path |
 |---------|-------------|
@@ -122,16 +153,22 @@ Alizode's architecture is informed by `/Users/tee/src/krypton`, an Electron-base
 - ✅ **Persistent subprocess**: `acp_spawn()` once, then `acp_prompt()` per turn
 - ✅ **Epoch tracking**: `epochRef` counter prevents stale event handlers after lane switch
 - ✅ **Per-lane transcript ownership**: module-level `allEvents` Map, no swap-on-switch
-- ✅ **LaneInbox/LaneBus**: in-memory channels for inter-lane messaging
+- ✅ **LaneInbox/LaneBus/InterLaneCoordinator**: in-memory channels for inter-lane messaging with drain-on-idle
 - ✅ **FS write review**: `FsWriteModal` shows old/new diff in permission modal
 - ✅ **Mention fan-out**: `@lane-id` in composer routes message to target lane
 - ✅ **cached_login_env()**: captures login shell env for macOS GUI PATH resolution
+- ✅ **Lane status machine** (Spec 103/106): `starting | idle | busy | needs_permission | awaiting_peer | error | stopped`
+- ✅ **Tail-window rendering** (Spec 103): render last 60 rows, cap 300 total per lane
+- ✅ **Drain-on-idle auto-prompt** (Spec 106): when peer_send delivers to idle lane, coordinator drains inbox and `drainPromptCycle` auto-prompts the target via `client.prompt()`
+- ✅ **Soft awaiting peer** (Spec 116): `awaiting_peer` treated like `idle` for inbox drain and composer submit
+- ✅ **Claude MCP skip** (Spec 83): Claude lanes skip project MCP server injection (Claude loads `.mcp.json` natively)
+- ✅ **MCP capability gating** (Spec 83): HTTP/SSE servers only sent if agent advertises `mcpCapabilities.http`/`.sse`
 
 ### Patterns still to adopt
 
 - **Streaming markdown** (Spec 117): `streaming-markdown` npm package, per-lane parser, `appendStreaming()`/`sealStreaming()`
-- **Tail-window rendering** (Spec 103): render last 60 rows, cap 300 total per lane
-- **Lane status machine**: `starting | idle | busy | needs_permission | awaiting_peer | error | stopped`
+- **spawnEpoch guard** (Krypton pattern): cancel stale in-flight spawns when lane is deleted mid-spawn
+- **Contextual lane peek** (Spec 109): preview non-active lane transcript without switching
 
 ### What NOT to copy
 

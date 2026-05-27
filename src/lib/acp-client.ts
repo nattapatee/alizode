@@ -36,6 +36,7 @@ interface RawAcpEvent {
     [k: string]: unknown;
   };
   stopReason?: StopReason;
+  reason?: string;
   message?: string;
   method?: 'read' | 'write';
   path?: string;
@@ -51,6 +52,7 @@ export class AcpClient {
   private unlisten: UnlistenFn | null = null;
   private listeners: Array<(e: AcpEvent) => void> = [];
   private disposed = false;
+  dead = false;
   configOptions: AcpConfigOption[] = [];
   modelInfo: AcpModelInfo | null = null;
 
@@ -310,6 +312,9 @@ export class AcpClient {
         break;
       }
       case 'stop':
+        if (raw.reason === 'subprocess exited') {
+          this.dead = true;
+        }
         event = { type: 'stop', stopReason: (raw.stopReason ?? 'end_turn') as StopReason };
         break;
       case 'error':

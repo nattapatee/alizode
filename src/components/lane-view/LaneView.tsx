@@ -1,32 +1,34 @@
-import { useRef, useEffect, useState, useMemo, useCallback } from "react";
+import { useRef, useEffect, useMemo, useCallback } from "react";
 import type { Lane, LaneEvent } from "../../lib/acp-events";
 import { groupEventsIntoSegments } from "../../lib/acp-events";
 import { LaneHeader } from "./LaneHeader";
 import { EventRow } from "./EventRow";
 import { AgentTextBlock } from "./AgentTextBlock";
+import { expandTranscriptWindow } from "../../hooks/useLaneStream";
 
-const WINDOW_SIZE = 80;
 const SCROLL_THRESHOLD = 120;
 
 interface LaneViewProps {
   lane: Lane | null;
   events: LaneEvent[];
   isLoading?: boolean;
+  harnessStatus?: string;
+  transcriptWindow?: number;
   isStreaming?: boolean;
+  onCancel?: () => void;
 }
 
-export function LaneView({ lane, events, isLoading, isStreaming }: LaneViewProps) {
+export function LaneView({ lane, events, isLoading, harnessStatus, transcriptWindow = 60, isStreaming, onCancel }: LaneViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
-  const [visibleCount, setVisibleCount] = useState(WINDOW_SIZE);
 
   const segments = useMemo(() => groupEventsIntoSegments(events), [events]);
 
   const visibleSegments = useMemo(
-    () => segments.slice(-visibleCount),
-    [segments, visibleCount],
+    () => segments.slice(-transcriptWindow),
+    [segments, transcriptWindow],
   );
-  const hasOlder = segments.length > visibleCount;
+  const hiddenCount = Math.max(0, segments.length - transcriptWindow);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -35,7 +37,6 @@ export function LaneView({ lane, events, isLoading, isStreaming }: LaneViewProps
   }, []);
 
   useEffect(() => {
-    setVisibleCount(WINDOW_SIZE);
     stickRef.current = true;
   }, [lane?.id]);
 
@@ -47,6 +48,18 @@ export function LaneView({ lane, events, isLoading, isStreaming }: LaneViewProps
     });
   }, [events.length, segments.length]);
 
+  useEffect(() => {
+    if (!lane) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.key === "h") {
+        e.preventDefault();
+        expandTranscriptWindow(lane.workspace_id, lane.id);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [lane]);
+
   if (!lane) {
     return (
       <div className="log" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -57,14 +70,14 @@ export function LaneView({ lane, events, isLoading, isStreaming }: LaneViewProps
 
   return (
     <>
-      <LaneHeader lane={lane} />
+      <LaneHeader lane={lane} harnessStatus={harnessStatus} onCancel={onCancel} />
       <div ref={scrollRef} className="log" onScroll={handleScroll}>
-        {hasOlder && (
+        {hiddenCount > 0 && (
           <button
-            onClick={() => setVisibleCount((c) => c + WINDOW_SIZE)}
+            onClick={() => lane && expandTranscriptWindow(lane.workspace_id, lane.id)}
             className="log-load-more"
           >
-            Load {Math.min(WINDOW_SIZE, segments.length - visibleCount)} older
+            ^ {hiddenCount} earlier rows hidden (Ctrl+H)
           </button>
         )}
         {visibleSegments.length === 0 ? (

@@ -78,6 +78,18 @@ pub async fn lane_stop(
 }
 
 #[tauri::command]
+pub async fn lane_set_status(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    lane_id: String,
+    status: String,
+) -> Result<(), String> {
+    let db = state.db.lock().await;
+    db.update_lane_status(&workspace_id, &lane_id, &status)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn lane_set_main(
     state: State<'_, AppState>,
     workspace_id: String,

@@ -133,6 +133,11 @@ export interface AcpMcpServerSse {
 
 export type AcpMcpServerDescriptor = AcpMcpServerStdio | AcpMcpServerHttp | AcpMcpServerSse;
 
+export interface AcpMcpCapabilities {
+  http?: boolean;
+  sse?: boolean;
+}
+
 export interface AcpSessionInfo {
   sessionId: string;
   cwd: string;
@@ -169,6 +174,22 @@ export type HarnessLaneStatus =
   | 'awaiting_peer'
   | 'error'
   | 'stopped';
+
+export interface LaneStatusEvent {
+  laneId: string;
+  prev: HarnessLaneStatus;
+  next: HarnessLaneStatus;
+  at: number;
+}
+
+export interface HarnessMcpLaneStats {
+  lane_label: string;
+  initialize_count: number;
+  tools_list_count: number;
+  tools_call_count: number;
+  last_method: string;
+  last_seen_at: number;
+}
 
 export type AcpEvent =
   | { type: 'user_message_chunk'; text: string }

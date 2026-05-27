@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { WorkspaceTabs } from "./components/workspace-tabs/WorkspaceTabs";
 import { LaneList } from "./components/lane-list/LaneList";
@@ -13,6 +14,7 @@ import { FsWriteModal } from "./components/fs-write-modal/FsWriteModal";
 import { PeerToast } from "./components/peer-toast/PeerToast";
 import { Onboarding } from "./components/onboarding/Onboarding";
 import { Stage } from "./components/stage/Stage";
+import { PeerBus } from "./components/peer-bus/PeerBus";
 import { WorkspaceIntro } from "./components/workspace-intro/WorkspaceIntro";
 import { ModelPicker } from "./components/model-picker/ModelPicker";
 import { ConfigPicker } from "./components/config-picker/ConfigPicker";
@@ -20,9 +22,11 @@ import type { AcpConfigOption } from "./lib/acp-types";
 import { SessionPicker } from "./components/session-picker/SessionPicker";
 import { AgentPicker } from "./components/agent-picker/AgentPicker";
 import { CHAR_BY_ID } from "./lib/characters";
+import { getActiveThoughtText } from "./lib/acp-events";
 import { useWorkspace } from "./hooks/useWorkspace";
-import { useLaneStream } from "./hooks/useLaneStream";
+import { useLaneStream, pushPeerEvent, pushSystemEvent, setHarnessLaneStatus } from "./hooks/useLaneStream";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { useHarnessCoordinator } from "./hooks/useHarnessCoordinator";
 
 export default function App() {
   const {
@@ -37,6 +41,7 @@ export default function App() {
     activeClient,
     getClient,
     getOrSpawnClient,
+    setLaneStatus,
     createWorkspace,
     createLane,
     deleteLane,
@@ -46,17 +51,57 @@ export default function App() {
     refreshLanes,
   } = useWorkspace();
 
+  useHarnessCoordinator(getOrSpawnClient, lanes);
+
   const handleDrainAction = useCallback(
     async (action: { lane_id: string; prompt_text: string }) => {
+      const lane = lanes.find((l) => l.id === action.lane_id);
+      const wsId = lane?.workspace_id ?? activeWorkspaceId ?? "";
       const drainClient = await getOrSpawnClient(action.lane_id);
-      if (drainClient) {
-        drainClient.prompt([{ type: "text", text: action.prompt_text }]).catch(() => {});
+      if (!drainClient) {
+        if (wsId) pushSystemEvent(wsId, action.lane_id, "drain: no client available");
+        return;
+      }
+      if (wsId) {
+        setHarnessLaneStatus(wsId, action.lane_id, "busy");
+        pushSystemEvent(wsId, action.lane_id, "processing peer message…");
+      }
+      await invoke("inter_lane_set_status", { laneId: action.lane_id, status: "busy" }).catch(() => {});
+      try {
+        await drainClient.prompt([{ type: "text", text: action.prompt_text }]);
+      } catch (err) {
+        if (wsId) {
+          setHarnessLaneStatus(wsId, action.lane_id, "error");
+          pushSystemEvent(wsId, action.lane_id, `drain error: ${String(err)}`);
+        }
+        await invoke("inter_lane_set_status", { laneId: action.lane_id, status: "error" }).catch(() => {});
+        return;
+      }
+      const nextStatus = await invoke<string | null>("inter_lane_on_stop", { laneId: action.lane_id }).catch(() => null);
+      if (!nextStatus) return;
+      if (wsId) {
+        setHarnessLaneStatus(wsId, action.lane_id, nextStatus as "idle" | "awaiting_peer");
+      }
+      const nextDrain = await invoke<{ lane_id: string; prompt_text: string } | null>(
+        "inter_lane_set_status",
+        { laneId: action.lane_id, status: nextStatus },
+      ).catch(() => null);
+      if (nextDrain) {
+        handleDrainAction(nextDrain);
       }
     },
-    [getOrSpawnClient],
+    [getOrSpawnClient, lanes, activeWorkspaceId],
   );
 
-  const { events, addUserInput, addSystemEvent, clearEvents, isLoading } = useLaneStream(activeLaneId, activeWorkspaceId, activeClient, handleDrainAction);
+  const { events, addUserInput, addSystemEvent, clearEvents, isLoading, laneStatus, transcriptWindow } = useLaneStream(
+    activeLaneId,
+    activeWorkspaceId,
+    activeClient,
+    handleDrainAction,
+    setLaneStatus,
+  );
+
+  const activeThought = useMemo(() => getActiveThoughtText(events), [events]);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [showSessionPicker, setShowSessionPicker] = useState(false);
   const [configPickerOption, setConfigPickerOption] = useState<AcpConfigOption | null>(null);
@@ -65,9 +110,35 @@ export default function App() {
   const [introShown, setIntroShown] = useState<Set<string>>(new Set());
   const [showCreateMenu, setShowCreateMenu] = useState(false);
   const [showAgentPicker, setShowAgentPicker] = useState(false);
+  const [rightTab, setRightTab] = useState<"stage" | "bus">("stage");
+  const [peerMsgCount, setPeerMsgCount] = useState(0);
+
+  useEffect(() => {
+    const bump = () => setPeerMsgCount((n) => n + 1);
+    const unsubs = [
+      listen("acp-inter-lane-message", bump),
+      listen("acp-peer-reply", bump),
+      listen("acp-review-requested", bump),
+    ];
+    return () => { unsubs.forEach((p) => p.then((fn) => fn())); };
+  }, []);
 
   const isLibrary = activeWorkspaceId ? libraryWorkspaces.has(activeWorkspaceId) : false;
   const isEditor = activeWorkspaceId ? editorWorkspaces.has(activeWorkspaceId) : false;
+
+  const handleCancelLane = useCallback(async () => {
+    if (!activeLaneId) return;
+    const client = activeClient;
+    if (client) {
+      try {
+        await client.cancel();
+      } catch {
+        // cancel may fail if process already exited
+      }
+    }
+    setHarnessLaneStatus(activeWorkspaceId ?? "", activeLaneId, "idle");
+    addSystemEvent("agent stopped");
+  }, [activeLaneId, activeWorkspaceId, activeClient, addSystemEvent]);
 
   const handleSessionResume = useCallback(
     async (sessionId: string) => {
@@ -236,11 +307,12 @@ export default function App() {
                 message,
                 done: false,
               });
+              if (result.delivered && activeWorkspaceId) {
+                pushPeerEvent(activeWorkspaceId, activeLaneId, "PeerOut", activeLaneId, target.id, message);
+                pushPeerEvent(target.workspace_id, target.id, "PeerIn", activeLaneId, target.id, message);
+              }
               if (result.drain) {
-                const drainClient = await getOrSpawnClient(result.drain.lane_id);
-                if (drainClient) {
-                  drainClient.prompt([{ type: "text", text: result.drain.prompt_text }]).catch(() => {});
-                }
+                handleDrainAction(result.drain);
               }
               if (result.error) {
                 addSystemEvent(`peer error: ${result.error}`);
@@ -298,7 +370,7 @@ export default function App() {
             return;
           case "stop":
             if (!activeWorkspaceId) return;
-            await invoke("lane_stop", { workspaceId: activeWorkspaceId, laneId: activeLaneId });
+            setHarnessLaneStatus(activeWorkspaceId, activeLaneId!, "stopped");
             addSystemEvent("lane stopped");
             return;
           case "cancel":
@@ -341,10 +413,12 @@ export default function App() {
           addSystemEvent("error: could not spawn agent");
         }
       } catch (err) {
+        setHarnessLaneStatus(activeWorkspaceId ?? "", activeLaneId, "error");
+        await invoke("inter_lane_set_status", { laneId: activeLaneId, status: "error" }).catch(() => {});
         addSystemEvent(`prompt error: ${err}`);
       }
     },
-    [activeLaneId, activeWorkspaceId, activeClient, lanes, addUserInput, addSystemEvent, clearEvents, getClient, getOrSpawnClient],
+    [activeLaneId, activeWorkspaceId, activeClient, lanes, addUserInput, addSystemEvent, clearEvents, getClient, getOrSpawnClient, handleDrainAction],
   );
 
   const keyboardActions = useMemo(
@@ -426,11 +500,14 @@ export default function App() {
               lane={activeLane}
               events={events}
               isLoading={isLoading}
+              harnessStatus={laneStatus}
+              transcriptWindow={transcriptWindow}
               isStreaming={
-                activeLane?.status === "Running" &&
+                isLoading &&
                 events.length > 0 &&
                 events[events.length - 1].kind === "AgentText"
               }
+              onCancel={handleCancelLane}
             />
             <CommandBar
               laneId={activeLaneId}
@@ -439,17 +516,46 @@ export default function App() {
               onSubmit={handleCommand}
             />
           </main>
-          <Stage
-            lane={activeLane}
-            eventCount={events.length}
-            isStreaming={
-              activeLane?.status === "Running" &&
-              events.length > 0 &&
-              events[events.length - 1].kind === "AgentText"
-            }
-            lanes={lanes}
-            onSelectLane={setActiveLaneId}
-          />
+          <aside className="right-panel">
+            <div className="rp-tabs">
+              <button
+                className={`rp-tab${rightTab === "stage" ? " rp-tab-active" : ""}`}
+                onClick={() => setRightTab("stage")}
+              >
+                AGENT_PORTAL
+              </button>
+              <button
+                className={`rp-tab${rightTab === "bus" ? " rp-tab-active" : ""}`}
+                onClick={() => setRightTab("bus")}
+              >
+                PEER_BUS
+                {peerMsgCount > 0 && (
+                  <span className="rp-tab-badge">{peerMsgCount}</span>
+                )}
+              </button>
+              <span className="rp-stage-id">
+                {rightTab === "stage"
+                  ? `#${activeLane?.agent_kind ?? "---"}`
+                  : "#bus"}
+              </span>
+            </div>
+            {rightTab === "stage" ? (
+              <Stage
+                lane={activeLane}
+                eventCount={events.length}
+                activeThought={activeThought}
+                isStreaming={
+                  isLoading &&
+                  events.length > 0 &&
+                  events[events.length - 1].kind === "AgentText"
+                }
+                lanes={lanes}
+                onSelectLane={setActiveLaneId}
+              />
+            ) : (
+              <PeerBus lanes={lanes} activeLaneId={activeLaneId} />
+            )}
+          </aside>
         </div>
       )}
 

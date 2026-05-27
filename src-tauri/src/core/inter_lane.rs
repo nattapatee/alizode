@@ -93,6 +93,9 @@ impl InterLaneCoordinator {
     }
 
     pub fn register_lane(&mut self, lane_id: &str, display_name: &str, backend_id: &str) {
+        self.pending.remove(lane_id);
+        self.inboxes.remove(lane_id);
+        self.cancelled_pairs.retain(|k| !k.contains(lane_id));
         self.lanes.insert(
             lane_id.to_string(),
             LaneState {
@@ -375,6 +378,9 @@ impl InterLaneCoordinator {
             if env.done || env.kind == EnvelopeKind::MentionRequest {
                 self.clear_pending_from_peer(&env.from_lane_id, lane_id);
             }
+            if env.done {
+                self.clear_pending_from_peer(lane_id, &env.from_lane_id);
+            }
         }
 
         let prompt_text = compose_prompt(&envelopes, &self.lanes);
@@ -412,21 +418,23 @@ fn compose_prompt(envelopes: &[InterLaneEnvelope], lanes: &HashMap<String, LaneS
 
         if env.done {
             parts.push(format!(
-                "[inter-lane] {sender_name} closed the conversation (done:true).\n\
-                 Do NOT call peer_send again. End your turn."
+                "[inter-lane] From {sender_name} (done:true):\n\n{}\n\n\
+                 [inter-lane] {sender_name} closed the conversation. \
+                 Do NOT call peer_send again. End your turn.",
+                env.message,
             ));
         } else if env.kind == EnvelopeKind::MentionRequest {
             parts.push(format!(
                 "[mention] From {sender_name}:\n\n{}\n\n\
-                 Reply via peer_send({{ to_lane: \"{}\", message, done: true }}).",
-                env.message, env.from_lane_id,
+                 Reply via peer_reply({{ to_lane: \"{}\", envelope_id: \"{}\", reply: \"your response\" }}).",
+                env.message, env.from_lane_id, env.id,
             ));
         } else {
             parts.push(format!(
                 "[inter-lane] From {sender_name} (id: {}):\n\n{}\n\n\
-                 [inter-lane] Reply by calling peer_send({{ to_lane: \"{}\", message, done }}).\n\
-                 Set done:true if you have nothing substantive to add; the conversation ends silently.",
-                env.id, env.message, env.from_lane_id,
+                 [inter-lane] Reply by calling peer_reply({{ to_lane: \"{}\", envelope_id: \"{}\", reply: \"your response\" }}).\n\
+                 This closes the conversation after your reply. End your turn after replying.",
+                env.id, env.message, env.from_lane_id, env.id,
             ));
         }
     }
@@ -551,6 +559,26 @@ mod tests {
         let result = coord.deliver(env("a", "b"));
         assert!(!result.delivered);
         assert!(result.error.unwrap().contains("cancelled"));
+    }
+
+    #[test]
+    fn done_reply_clears_original_pending() {
+        let mut coord = setup();
+        coord.set_status("b", HarnessLaneStatus::Busy);
+        coord.deliver(env("a", "b"));
+        assert_eq!(coord.on_lane_stop("a"), Some(HarnessLaneStatus::AwaitingPeer));
+        coord.set_status("a", HarnessLaneStatus::AwaitingPeer);
+
+        let mut reply = env("b", "a");
+        reply.done = true;
+        reply.message = "here is my reply".to_string();
+        coord.set_status("b", HarnessLaneStatus::Idle);
+        let result = coord.deliver(reply);
+        assert!(result.delivered);
+        assert!(result.drain.is_some());
+
+        let next = coord.on_lane_stop("a");
+        assert_eq!(next, Some(HarnessLaneStatus::Idle), "pending should be cleared by done:true reply");
     }
 
     #[test]

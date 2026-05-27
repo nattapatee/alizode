@@ -13,6 +13,22 @@ export type LaneEventKind =
 
 export type LaneStatus = "Idle" | "Running" | "Waiting" | "Error" | "Stopped";
 
+import type { HarnessLaneStatus } from "./acp-types";
+
+const HARNESS_TO_DB: Record<HarnessLaneStatus, LaneStatus> = {
+  starting: "Running",
+  idle: "Idle",
+  busy: "Running",
+  needs_permission: "Waiting",
+  awaiting_peer: "Waiting",
+  error: "Error",
+  stopped: "Stopped",
+};
+
+export function harnessStatusToDbStatus(s: HarnessLaneStatus): LaneStatus {
+  return HARNESS_TO_DB[s];
+}
+
 export type AgentKind = "Claude" | "Codex" | "Gemini" | "OpenCode" | "Cursor" | "Custom";
 
 export interface Workspace {
@@ -147,7 +163,7 @@ export function groupEventsIntoSegments(events: LaneEvent[]): ViewSegment[] {
     if (ev.kind === "AgentText") {
       if (agentChunks.length === 0) firstSeq = ev.seq;
       agentChunks.push(getEventText(ev));
-    } else {
+    } else if (ev.kind !== "Thought") {
       if (agentChunks.length > 0) {
         segments.push({
           type: "agent-text",
@@ -170,4 +186,28 @@ export function groupEventsIntoSegments(events: LaneEvent[]): ViewSegment[] {
   }
 
   return segments;
+}
+
+/** Live thought for the current turn — blank once the agent answer has started. */
+export function getActiveThoughtText(events: LaneEvent[]): string {
+  let turnStart = -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].kind === "UserIn") {
+      turnStart = i;
+      break;
+    }
+  }
+  if (turnStart < 0) return "";
+
+  const turnEvents = events.slice(turnStart + 1);
+  if (turnEvents.some((e) => e.kind === "AgentText")) {
+    return "";
+  }
+
+  const text = turnEvents
+    .filter((e) => e.kind === "Thought")
+    .map((e) => getEventText(e))
+    .join("");
+
+  return text.trim();
 }

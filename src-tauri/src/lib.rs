@@ -1,5 +1,6 @@
 mod commands;
 mod core;
+mod harness_mcp;
 mod permission;
 mod store;
 mod util;
@@ -38,12 +39,15 @@ pub fn run() {
 
             app.manage(Arc::new(AcpRegistry::new()));
             let coordinator = Arc::new(std::sync::Mutex::new(InterLaneCoordinator::new()));
+            let harness = Arc::new(harness_mcp::HarnessMcpState::new(db.clone()));
+            app.manage(harness.clone());
             app.manage(AppState {
                 data_dir: data_dir.clone(),
                 db,
                 permissions,
                 coordinator,
             });
+            harness_mcp::start(app.handle().clone(), harness);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -53,13 +57,19 @@ pub fn run() {
             commands::workspace::workspace_rename,
             commands::workspace::workspace_update_cwd,
             commands::workspace::workspace_delete,
-            commands::workspace::mcp_bridge_descriptor,
-            commands::workspace::load_project_mcp_servers,
+            harness_mcp::harness_mcp_port,
+            harness_mcp::harness_mcp_reply,
+            harness_mcp::list_harness_mcp_stats,
+            harness_mcp::harness_mcp_bridge_descriptor,
+            harness_mcp::harness_id,
+            commands::mcp_config::read_mcp_config_file,
+            core::acp::acp_login_env,
             commands::lane::lane_list,
             commands::lane::lane_create,
             commands::lane::lane_delete,
             commands::lane::lane_send_user,
             commands::lane::lane_stop,
+            commands::lane::lane_set_status,
             commands::lane::lane_set_main,
             commands::lane::lane_events,
             commands::lane::lane_update_model,
@@ -73,6 +83,7 @@ pub fn run() {
             commands::memory::memory_list,
             commands::permission::permission_decide,
             commands::permission::permission_clear_cache,
+            commands::review::collect_review_git_state,
             commands::inter_lane::inter_lane_register,
             commands::inter_lane::inter_lane_unregister,
             commands::inter_lane::inter_lane_set_status,

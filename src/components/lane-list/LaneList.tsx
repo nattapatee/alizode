@@ -48,7 +48,12 @@ export function LaneList({ lanes, activeId, onSelect, onCreate, onDelete }: Prop
             onClick={() => onSelect(lane.id)}
             style={{ "--lane-accent": c?.accent ?? "var(--cyan)" } as React.CSSProperties}
           >
-            <span className={"lane-dot status-" + (lane.status === "Running" ? "thinking" : "idle")} />
+            <span className={"lane-dot status-" + (
+              lane.status === "Running" ? "thinking" :
+              lane.status === "Waiting" ? "waiting" :
+              lane.status === "Error" ? "error" :
+              lane.status === "Stopped" ? "stopped" : "idle"
+            )} />
             <span className="lane-name">{c?.name ?? lane.agent_kind}</span>
             {lane.is_main && (
               <span style={{ fontSize: 9, color: "var(--orange)" }}>M</span>
