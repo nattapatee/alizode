@@ -6,4 +6,6 @@ pub mod mcp_config;
 pub mod memory;
 pub mod permission;
 pub mod review;
+pub mod team;
+pub mod terminal;
 pub mod workspace;

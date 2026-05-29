@@ -17,8 +17,34 @@ impl Database {
     }
 
     pub fn run_migrations(&self) -> Result<()> {
-        let migration = include_str!("../../migrations/001_init.sql");
-        self.conn.execute_batch(migration)?;
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            );"
+        )?;
+
+        let migrations: &[(i64, &str)] = &[
+            (1, include_str!("../../migrations/001_init.sql")),
+            (2, include_str!("../../migrations/002_teams.sql")),
+        ];
+
+        let current_version: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+
+        for &(version, sql) in migrations {
+            if version > current_version {
+                self.conn.execute_batch(sql)?;
+                self.conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    (version, now_ms()),
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -57,53 +83,51 @@ impl Database {
         self.conn.execute("DELETE FROM memory WHERE workspace_id = ?1", [id])?;
         self.conn.execute("DELETE FROM peer_messages WHERE workspace_id = ?1", [id])?;
         self.conn.execute("DELETE FROM review_requests WHERE workspace_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM teams WHERE workspace_id = ?1", [id])?;
         self.conn.execute("DELETE FROM workspaces WHERE id = ?1", [id])?;
         Ok(())
     }
 
     pub fn list_lanes(&self, workspace_id: &str) -> Result<Vec<Lane>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, workspace_id, agent_kind, protocol, model, is_main, status, cwd, created_at \
+            "SELECT id, workspace_id, agent_kind, protocol, model, is_main, status, cwd, \
+             created_at, team_id, directive, is_leader, team_sort_order \
              FROM lanes WHERE workspace_id = ?1 ORDER BY created_at",
         )?;
-        let rows = stmt.query_map([workspace_id], |row| {
-            Ok(Lane {
-                id: row.get(0)?,
-                workspace_id: row.get(1)?,
-                agent_kind: row.get(2)?,
-                protocol: row.get(3)?,
-                model: row.get(4)?,
-                is_main: row.get::<_, i32>(5)? != 0,
-                status: row.get(6)?,
-                cwd: row.get(7)?,
-                created_at: row.get(8)?,
-            })
-        })?;
+        let rows = stmt.query_map([workspace_id], lane_from_row)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn get_lane(&self, lane_id: &str) -> Result<Option<Lane>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, workspace_id, agent_kind, protocol, model, is_main, status, cwd, created_at \
+            "SELECT id, workspace_id, agent_kind, protocol, model, is_main, status, cwd, \
+             created_at, team_id, directive, is_leader, team_sort_order \
              FROM lanes WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map([lane_id], |row| {
-            Ok(Lane {
-                id: row.get(0)?,
-                workspace_id: row.get(1)?,
-                agent_kind: row.get(2)?,
-                protocol: row.get(3)?,
-                model: row.get(4)?,
-                is_main: row.get::<_, i32>(5)? != 0,
-                status: row.get(6)?,
-                cwd: row.get(7)?,
-                created_at: row.get(8)?,
-            })
-        })?;
+        let mut rows = stmt.query_map([lane_id], lane_from_row)?;
         match rows.next() {
             Some(Ok(lane)) => Ok(Some(lane)),
             Some(Err(e)) => Err(e.into()),
             None => Ok(None),
+        }
+    }
+
+    /// Smallest free `{agent_kind}-{n}` id within a workspace. Avoids PRIMARY KEY
+    /// collisions after lane deletions or when a team adds multiple same-kind lanes
+    /// (the old `count + 1` scheme reused ids that still existed).
+    fn next_lane_id(&self, workspace_id: &str, agent_kind: &str) -> Result<String> {
+        let mut n = 1;
+        loop {
+            let candidate = format!("{}-{}", agent_kind, n);
+            let exists: i32 = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM lanes WHERE workspace_id = ?1 AND id = ?2)",
+                (workspace_id, &candidate),
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                return Ok(candidate);
+            }
+            n += 1;
         }
     }
 
@@ -113,11 +137,7 @@ impl Database {
             [&input.workspace_id],
             |row| row.get(0),
         )?;
-        let id = format!(
-            "{}-{}",
-            input.agent_kind,
-            count + 1
-        );
+        let id = self.next_lane_id(&input.workspace_id, &input.agent_kind)?;
         let is_main = count == 0;
         let now = now_ms();
         self.conn.execute(
@@ -145,6 +165,10 @@ impl Database {
             status: "Idle".to_string(),
             cwd: input.cwd.clone(),
             created_at: now,
+            team_id: None,
+            directive: String::new(),
+            is_leader: false,
+            team_sort_order: 0,
         })
     }
 
@@ -520,6 +544,223 @@ impl Database {
         Ok(())
     }
 
+    // --- Team methods ---
+
+    pub fn create_team(&self, input: &CreateTeamInput) -> Result<CreateTeamResult> {
+        if input.name.trim().is_empty() {
+            anyhow::bail!("team name must not be empty");
+        }
+        if input.members.len() < 2 || input.members.len() > 4 {
+            anyhow::bail!("team must have 2-4 members");
+        }
+        let leader_count = input.members.iter().filter(|m| m.is_leader).count();
+        if leader_count != 1 {
+            anyhow::bail!("team must have exactly one leader");
+        }
+        for m in &input.members {
+            if m.directive.trim().is_empty() {
+                anyhow::bail!("every member must have a non-empty directive");
+            }
+        }
+
+        let team_id = uuid::Uuid::new_v4().to_string();
+        let now = now_ms();
+
+        // Atomic: a failure anywhere below rolls back the team + any lanes/preset
+        // so we never leave an orphan team row with no members.
+        let tx = self.conn.unchecked_transaction()?;
+
+        self.conn.execute(
+            "INSERT INTO teams (id, workspace_id, name, preset_id, created_at) \
+             VALUES (?1, ?2, ?3, NULL, ?4)",
+            (&team_id, &input.workspace_id, &input.name, &now),
+        )?;
+
+        let mut lanes = Vec::new();
+        let ws_lane_count: i32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM lanes WHERE workspace_id = ?1",
+            [&input.workspace_id],
+            |row| row.get(0),
+        )?;
+        for (idx, member) in input.members.iter().enumerate() {
+            let lane_id = self.next_lane_id(&input.workspace_id, &member.agent_kind)?;
+            let is_main = ws_lane_count == 0 && idx == 0;
+
+            self.conn.execute(
+                "INSERT INTO lanes (id, workspace_id, agent_kind, protocol, model, is_main, \
+                 status, cwd, created_at, team_id, directive, is_leader, team_sort_order) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                (
+                    &lane_id, &input.workspace_id, &member.agent_kind, "NativeAcp",
+                    &member.model, if is_main { 1 } else { 0 }, "Idle",
+                    &input.cwd, &now, &team_id, &member.directive,
+                    if member.is_leader { 1 } else { 0 }, &member.sort_order,
+                ),
+            )?;
+
+            lanes.push(Lane {
+                id: lane_id,
+                workspace_id: input.workspace_id.clone(),
+                agent_kind: member.agent_kind.clone(),
+                protocol: "NativeAcp".to_string(),
+                model: member.model.clone(),
+                is_main,
+                status: "Idle".to_string(),
+                cwd: input.cwd.clone(),
+                created_at: now,
+                team_id: Some(team_id.clone()),
+                directive: member.directive.clone(),
+                is_leader: member.is_leader,
+                team_sort_order: member.sort_order,
+            });
+        }
+
+        let preset_id = if input.save_as_preset {
+            let pid = uuid::Uuid::new_v4().to_string();
+            self.conn.execute(
+                "INSERT INTO team_presets (id, name, created_at) VALUES (?1, ?2, ?3)",
+                (&pid, &input.name, &now),
+            )?;
+            for member in &input.members {
+                let mid = uuid::Uuid::new_v4().to_string();
+                self.conn.execute(
+                    "INSERT INTO team_preset_members (id, preset_id, agent_kind, model, \
+                     directive, is_leader, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (
+                        &mid, &pid, &member.agent_kind, &member.model,
+                        &member.directive, if member.is_leader { 1 } else { 0 },
+                        &member.sort_order,
+                    ),
+                )?;
+            }
+            self.conn.execute(
+                "UPDATE teams SET preset_id = ?1 WHERE id = ?2",
+                (&pid, &team_id),
+            )?;
+            Some(pid)
+        } else {
+            None
+        };
+
+        tx.commit()?;
+
+        let team = Team {
+            id: team_id,
+            workspace_id: input.workspace_id.clone(),
+            name: input.name.clone(),
+            preset_id,
+            created_at: now,
+        };
+
+        Ok(CreateTeamResult { team, lanes })
+    }
+
+    pub fn list_teams(&self, workspace_id: &str) -> Result<Vec<Team>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, name, preset_id, created_at \
+             FROM teams WHERE workspace_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([workspace_id], |row| {
+            Ok(Team {
+                id: row.get(0)?,
+                workspace_id: row.get(1)?,
+                name: row.get(2)?,
+                preset_id: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn delete_team(&self, team_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE lanes SET team_id = NULL, directive = '', is_leader = 0, \
+             team_sort_order = 0 WHERE team_id = ?1",
+            [team_id],
+        )?;
+        self.conn.execute("DELETE FROM teams WHERE id = ?1", [team_id])?;
+        Ok(())
+    }
+
+    pub fn list_team_presets(&self) -> Result<Vec<TeamPresetWithMembers>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, created_at FROM team_presets ORDER BY created_at",
+        )?;
+        let presets: Vec<TeamPreset> = stmt
+            .query_map([], |row| {
+                Ok(TeamPreset {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut result = Vec::new();
+        for preset in presets {
+            let mut mstmt = self.conn.prepare(
+                "SELECT id, preset_id, agent_kind, model, directive, is_leader, sort_order \
+                 FROM team_preset_members WHERE preset_id = ?1 ORDER BY sort_order",
+            )?;
+            let members: Vec<TeamPresetMember> = mstmt
+                .query_map([&preset.id], |row| {
+                    Ok(TeamPresetMember {
+                        id: row.get(0)?,
+                        preset_id: row.get(1)?,
+                        agent_kind: row.get(2)?,
+                        model: row.get(3)?,
+                        directive: row.get(4)?,
+                        is_leader: row.get::<_, i32>(5)? != 0,
+                        sort_order: row.get(6)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            result.push(TeamPresetWithMembers { preset, members });
+        }
+        Ok(result)
+    }
+
+    pub fn save_team_preset(
+        &self,
+        name: &str,
+        members: &[CreateTeamMemberInput],
+    ) -> Result<TeamPreset> {
+        let pid = uuid::Uuid::new_v4().to_string();
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO team_presets (id, name, created_at) VALUES (?1, ?2, ?3)",
+            (&pid, name, &now),
+        )?;
+        for member in members {
+            let mid = uuid::Uuid::new_v4().to_string();
+            self.conn.execute(
+                "INSERT INTO team_preset_members (id, preset_id, agent_kind, model, \
+                 directive, is_leader, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    &mid, &pid, &member.agent_kind, &member.model, &member.directive,
+                    if member.is_leader { 1 } else { 0 }, &member.sort_order,
+                ),
+            )?;
+        }
+        Ok(TeamPreset {
+            id: pid,
+            name: name.to_string(),
+            created_at: now,
+        })
+    }
+
+    pub fn delete_team_preset(&self, preset_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM team_preset_members WHERE preset_id = ?1",
+            [preset_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM team_presets WHERE id = ?1",
+            [preset_id],
+        )?;
+        Ok(())
+    }
+
     pub fn memory_list(&self, workspace_id: &str, namespace: &str) -> Result<Vec<MemoryEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT workspace_id, namespace, key, value, updated_at \
@@ -536,6 +777,24 @@ impl Database {
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
+}
+
+fn lane_from_row(row: &rusqlite::Row) -> rusqlite::Result<Lane> {
+    Ok(Lane {
+        id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        agent_kind: row.get(2)?,
+        protocol: row.get(3)?,
+        model: row.get(4)?,
+        is_main: row.get::<_, i32>(5)? != 0,
+        status: row.get(6)?,
+        cwd: row.get(7)?,
+        created_at: row.get(8)?,
+        team_id: row.get(9)?,
+        directive: row.get(10)?,
+        is_leader: row.get::<_, i32>(11)? != 0,
+        team_sort_order: row.get(12)?,
+    })
 }
 
 fn now_ms() -> i64 {

@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
+import { WikiPanel } from "../wiki-panel/WikiPanel";
 
 interface Props {
   laneId: string | null;
@@ -10,6 +11,7 @@ interface Props {
 export function CommandBar({ laneId, laneStatus, lanes, onSubmit }: Props) {
   const [value, setValue] = useState("");
   const [mentionHints, setMentionHints] = useState<string[]>([]);
+  const [showWiki, setShowWiki] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const isBusy = laneStatus === "Running";
 
@@ -87,7 +89,14 @@ export function CommandBar({ laneId, laneStatus, lanes, onSubmit }: Props) {
         disabled={!laneId}
       />
       {isBusy && <span className="cmp-busy">BUSY</span>}
-      <span className="cmp-help">?HELP</span>
+      <button
+        type="button"
+        className={"cmp-help" + (showWiki ? " on" : "")}
+        onClick={() => setShowWiki((v) => !v)}
+      >
+        ?WIKI
+      </button>
+      {showWiki && <WikiPanel onClose={() => setShowWiki(false)} />}
     </form>
   );
 }

@@ -41,6 +41,7 @@ pub fn run() {
             let coordinator = Arc::new(std::sync::Mutex::new(InterLaneCoordinator::new()));
             let harness = Arc::new(harness_mcp::HarnessMcpState::new(db.clone()));
             app.manage(harness.clone());
+            app.manage(commands::terminal::new_store());
             app.manage(AppState {
                 data_dir: data_dir.clone(),
                 db,
@@ -106,6 +107,16 @@ pub fn run() {
             core::acp::acp_permission_response,
             core::acp::acp_fs_write_response,
             core::acp::acp_dispose,
+            commands::team::team_create,
+            commands::team::team_list,
+            commands::team::team_delete,
+            commands::team::team_presets_list,
+            commands::team::team_preset_save,
+            commands::team::team_preset_delete,
+            commands::terminal::terminal_spawn,
+            commands::terminal::terminal_write,
+            commands::terminal::terminal_resize,
+            commands::terminal::terminal_kill,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

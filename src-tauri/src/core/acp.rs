@@ -231,7 +231,19 @@ impl AcpClient {
                     Ok(v.get("result").cloned().unwrap_or(Value::Null))
                 }
             }
-            Err(_) => Err(format!("{method}: subprocess closed before reply")),
+            Err(_) => {
+                let tail = self.stderr_snapshot().await;
+                let tail = tail.trim();
+                if tail.is_empty() {
+                    Err(format!("{method}: subprocess closed before reply"))
+                } else {
+                    let snippet: String = tail.chars().rev().take(800).collect::<Vec<_>>()
+                        .into_iter().rev().collect();
+                    Err(format!(
+                        "{method}: subprocess closed before reply — stderr: {snippet}"
+                    ))
+                }
+            }
         }
     }
 
@@ -1143,12 +1155,30 @@ pub async fn acp_prompt(
         .ok()
         .and_then(|g| g.clone())
         .ok_or_else(|| "session not initialized".to_string())?;
-    client
-        .request(
+    // Guard against an agent that never returns a stop (e.g. a backend stuck on
+    // an MCP tool call). Without this the lane shows "processing…" forever.
+    match tokio::time::timeout(
+        Duration::from_secs(180),
+        client.request(
             "session/prompt",
             json!({ "sessionId": acp_session_id, "prompt": blocks }),
-        )
-        .await
+        ),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => {
+            let tail = client.stderr_snapshot().await;
+            let tail = tail.trim();
+            let snippet: String = tail.chars().rev().take(800).collect::<Vec<_>>()
+                .into_iter().rev().collect();
+            if snippet.is_empty() {
+                Err("session/prompt: timed out after 180s (no agent response, no stderr — backend likely hung)".to_string())
+            } else {
+                Err(format!("session/prompt: timed out after 180s — last stderr: {snippet}"))
+            }
+        }
+    }
 }
 
 #[tauri::command]

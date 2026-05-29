@@ -1,6 +1,8 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
+import { diffLines } from "diff";
 import type { AcpClient } from "../../lib/acp-client";
 import type { AcpEvent } from "../../lib/acp-types";
+import { openFullDiff } from "../full-diff-modal/FullDiffModal";
 
 interface PendingWrite {
   requestId: number;
@@ -13,143 +15,237 @@ interface Props {
   client: AcpClient | null;
 }
 
-export function FsWriteModal({ client }: Props) {
-  const [pending, setPending] = useState<PendingWrite | null>(null);
+const CONTEXT_LINES = 2;
+const LINE_CAP = 24;
 
-  useEffect(() => {
-    if (!client) return;
-    const unsub = client.onEvent((e: AcpEvent) => {
-      if (e.type === 'fs_write_pending') {
-        setPending({
-          requestId: e.requestId,
-          path: e.path,
-          oldText: e.oldText,
-          newText: e.newText,
-        });
+type DiffRow = { kind: "add" | "del" | "ctx"; text: string; oldNum: number | null; newNum: number | null };
+type DisplayRow = DiffRow | { kind: "gap" };
+
+function computeDisplayRows(oldText: string, newText: string): { rows: DisplayRow[]; moreCount: number; added: number; removed: number } {
+  const parts = diffLines(oldText, newText);
+  const allRows: DiffRow[] = [];
+  let oldLine = 1;
+  let newLine = 1;
+  let added = 0;
+  let removed = 0;
+
+  for (const p of parts) {
+    const raw = p.value.endsWith("\n") ? p.value.slice(0, -1) : p.value;
+    const lines = raw.split("\n");
+    const kind: DiffRow["kind"] = p.added ? "add" : p.removed ? "del" : "ctx";
+    if (p.added) added += p.count ?? lines.length;
+    if (p.removed) removed += p.count ?? lines.length;
+    for (const text of lines) {
+      if (kind === "add") {
+        allRows.push({ kind, text, oldNum: null, newNum: newLine++ });
+      } else if (kind === "del") {
+        allRows.push({ kind, text, oldNum: oldLine++, newNum: null });
+      } else {
+        allRows.push({ kind, text, oldNum: oldLine++, newNum: newLine++ });
       }
-    });
-    return unsub;
-  }, [client]);
+    }
+  }
 
-  const handleDecision = useCallback(
-    async (accept: boolean) => {
-      if (!client || !pending) return;
-      await client.respondFsWrite(pending.requestId, accept);
-      setPending(null);
-    },
-    [client, pending],
+  const keep = new Array<boolean>(allRows.length).fill(false);
+  for (let i = 0; i < allRows.length; i++) {
+    if (allRows[i].kind !== "ctx") {
+      for (let j = Math.max(0, i - CONTEXT_LINES); j <= Math.min(allRows.length - 1, i + CONTEXT_LINES); j++) {
+        keep[j] = true;
+      }
+    }
+  }
+
+  const display: DisplayRow[] = [];
+  let emitted = 0;
+  let inGap = false;
+  let firstHunk = true;
+  for (let i = 0; i < allRows.length; i++) {
+    if (!keep[i]) { inGap = true; continue; }
+    if (inGap && !firstHunk) display.push({ kind: "gap" });
+    inGap = false;
+    firstHunk = false;
+    if (emitted >= LINE_CAP) break;
+    display.push(allRows[i]);
+    emitted++;
+  }
+
+  let keptTotal = 0;
+  for (let i = 0; i < keep.length; i++) if (keep[i]) keptTotal++;
+  return { rows: display, moreCount: Math.max(0, keptTotal - emitted), added, removed };
+}
+
+function FsWriteDiffView({ pending }: { pending: PendingWrite }) {
+  const { rows, moreCount, added, removed } = useMemo(
+    () => computeDisplayRows(pending.oldText, pending.newText),
+    [pending.oldText, pending.newText],
   );
-
-  if (!pending) return null;
-
-  const fileName = pending.path.split('/').pop() ?? pending.path;
-  const isNew = pending.oldText.length === 0;
+  const filename = pending.path.split("/").pop() ?? pending.path;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="bg-surface-1 border border-surface-2 rounded-lg p-5 max-w-2xl w-full mx-4 shadow-2xl max-h-[80vh] flex flex-col">
-        <div className="flex items-center gap-2 mb-3">
-          <span className="w-2 h-2 rounded-full bg-neon-amber animate-pulse" />
-          <span className="text-xs font-mono text-neon-amber uppercase tracking-wider">
-            File Write Request
-          </span>
-        </div>
-
-        <p className="text-sm text-zinc-300 mb-1">
-          Agent wants to {isNew ? 'create' : 'modify'}
-        </p>
-        <p className="text-xs font-mono text-neon-cyan mb-3 truncate" title={pending.path}>
-          {pending.path}
-        </p>
-
-        <div className="flex-1 min-h-0 overflow-auto mb-4 border border-surface-2 rounded bg-surface-0">
-          <DiffView
-            fileName={fileName}
-            oldText={pending.oldText}
-            newText={pending.newText}
-          />
-        </div>
-
-        <div className="flex gap-2">
-          <button
-            onClick={() => handleDecision(true)}
-            className="flex-1 px-3 py-1.5 text-xs font-mono rounded
-                       bg-neon-green/10 text-neon-green border border-neon-green/30
-                       hover:bg-neon-green/20 transition-colors"
-          >
-            Accept
-          </button>
-          <button
-            onClick={() => handleDecision(false)}
-            className="flex-1 px-3 py-1.5 text-xs font-mono rounded
-                       bg-neon-red/10 text-neon-red border border-neon-red/30
-                       hover:bg-neon-red/20 transition-colors"
-          >
-            Reject
-          </button>
-        </div>
+    <div className="perm-diff">
+      <div className="perm-diff-header">
+        {filename}
+        <span className="perm-diff-stats">
+          {added > 0 && <span className="perm-diff-stat-add">+{added}</span>}
+          {removed > 0 && <span className="perm-diff-stat-del">−{removed}</span>}
+        </span>
+        <button
+          className="perm-diff-expand"
+          onClick={() => openFullDiff(pending.path, pending.oldText, pending.newText)}
+        >
+          full diff
+        </button>
+      </div>
+      <div className="perm-diff-body">
+        {rows.map((row, i) =>
+          row.kind === "gap" ? (
+            <div key={i} className="perm-diff-line perm-diff-gap">
+              <span className="perm-diff-num" />
+              <span className="perm-diff-num" />
+              <span className="perm-diff-sign">⋯</span>
+              <span className="perm-diff-text perm-diff-gap-text">context omitted</span>
+            </div>
+          ) : (
+            <div key={i} className={`perm-diff-line perm-diff-${row.kind}`}>
+              <span className="perm-diff-num">{row.oldNum ?? " "}</span>
+              <span className="perm-diff-num">{row.newNum ?? " "}</span>
+              <span className="perm-diff-sign">{row.kind === "add" ? "+" : row.kind === "del" ? "−" : " "}</span>
+              <span className="perm-diff-text">{row.text}</span>
+            </div>
+          ),
+        )}
+        {moreCount > 0 && (
+          <div className="perm-diff-more">… {moreCount} more line{moreCount === 1 ? "" : "s"}</div>
+        )}
       </div>
     </div>
   );
 }
 
-function DiffView({ fileName, oldText, newText }: { fileName: string; oldText: string; newText: string }) {
-  const oldLines = oldText.split('\n');
-  const newLines = newText.split('\n');
-  const lines: Array<{ type: 'same' | 'add' | 'remove'; text: string }> = [];
+export function FsWriteModal({ client }: Props) {
+  const [queue, setQueue] = useState<PendingWrite[]>([]);
+  const pending = queue[0] ?? null;
 
-  if (oldText.length === 0) {
-    for (const line of newLines) {
-      lines.push({ type: 'add', text: line });
-    }
-  } else {
-    let oi = 0;
-    let ni = 0;
-    while (oi < oldLines.length || ni < newLines.length) {
-      if (oi < oldLines.length && ni < newLines.length && oldLines[oi] === newLines[ni]) {
-        lines.push({ type: 'same', text: oldLines[oi] });
-        oi++;
-        ni++;
-      } else if (oi < oldLines.length) {
-        lines.push({ type: 'remove', text: oldLines[oi] });
-        oi++;
-      } else {
-        lines.push({ type: 'add', text: newLines[ni] });
-        ni++;
+  useEffect(() => {
+    if (!client) return;
+    const unsub = client.onEvent((e: AcpEvent) => {
+      if (e.type === "fs_write_pending") {
+        setQueue((q) => [...q, {
+          requestId: e.requestId,
+          path: e.path,
+          oldText: e.oldText,
+          newText: e.newText,
+        }]);
       }
-    }
-  }
+    });
+    return () => { unsub(); setQueue([]); };
+  }, [client]);
 
-  const displayLines = lines.length > 200 ? lines.slice(0, 200) : lines;
-  const truncated = lines.length > 200;
+  const handleDecision = useCallback(
+    async (accept: boolean) => {
+      if (!client || !pending) return;
+      try {
+        await client.respondFsWrite(pending.requestId, accept);
+      } catch {
+        return;
+      }
+      setQueue((q) => q.slice(1));
+    },
+    [client, pending],
+  );
+
+  const handleAcceptAll = useCallback(async () => {
+    if (!client || queue.length === 0) return;
+    for (const item of queue) {
+      try {
+        await client.respondFsWrite(item.requestId, true);
+      } catch { /* continue */ }
+    }
+    setQueue([]);
+  }, [client, queue]);
+
+  const handleRejectAll = useCallback(async () => {
+    if (!client || queue.length === 0) return;
+    for (const item of queue) {
+      try {
+        await client.respondFsWrite(item.requestId, false);
+      } catch { /* continue */ }
+    }
+    setQueue([]);
+  }, [client, queue]);
+
+  useEffect(() => {
+    if (!pending) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "a" && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        e.preventDefault();
+        handleDecision(true);
+      } else if (e.key === "r" && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        e.preventDefault();
+        handleDecision(false);
+      } else if (e.key === "A") {
+        e.preventDefault();
+        handleAcceptAll();
+      } else if (e.key === "R") {
+        e.preventDefault();
+        handleRejectAll();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        handleDecision(true);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        handleDecision(false);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [pending, handleDecision, handleAcceptAll, handleRejectAll]);
+
+  if (!pending) return null;
+
+  const isNew = pending.oldText.length === 0;
 
   return (
-    <div className="text-[11px] font-mono leading-relaxed">
-      <div className="px-2 py-1 text-zinc-500 border-b border-surface-2 sticky top-0 bg-surface-0">
-        {fileName} — {oldLines.length}→{newLines.length} lines
-      </div>
-      <pre className="p-2 whitespace-pre-wrap break-all">
-        {displayLines.map((line, i) => (
-          <div
-            key={i}
-            className={
-              line.type === 'add'
-                ? 'bg-neon-green/5 text-neon-green'
-                : line.type === 'remove'
-                  ? 'bg-neon-red/5 text-neon-red'
-                  : 'text-zinc-500'
-            }
-          >
-            <span className="inline-block w-4 text-right mr-2 select-none opacity-50">
-              {line.type === 'add' ? '+' : line.type === 'remove' ? '-' : ' '}
-            </span>
-            {line.text}
+    <div className="perm-overlay">
+      <div className="perm-modal">
+        <div className="perm-badge">
+          <span className="perm-dot" style={{ background: "var(--yellow)" }} />
+          <span className="perm-label">File {isNew ? "Create" : "Write"} Request</span>
+          {queue.length > 1 && (
+            <span className="perm-queue-count">{queue.length} queued</span>
+          )}
+        </div>
+
+        <p className="perm-desc">Agent wants to {isNew ? "create" : "modify"}</p>
+        <div className="perm-tool" title={pending.path}>{pending.path}</div>
+
+        <FsWriteDiffView pending={pending} />
+
+        <div className="perm-actions">
+          <div className="perm-main-actions">
+            <button className="perm-btn perm-allow" onClick={() => handleDecision(true)}>
+              Accept
+            </button>
+            <button className="perm-btn perm-deny" onClick={() => handleDecision(false)}>
+              Reject
+            </button>
           </div>
-        ))}
-        {truncated && (
-          <div className="text-zinc-600 mt-1">... {lines.length - 200} more lines</div>
-        )}
-      </pre>
+          {queue.length > 1 && (
+            <div className="perm-main-actions" style={{ marginTop: 6 }}>
+              <button className="perm-always" onClick={handleAcceptAll}>
+                Accept all ({queue.length})
+              </button>
+              <button className="perm-always" style={{ color: "var(--red)" }} onClick={handleRejectAll}>
+                Reject all ({queue.length})
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="perm-hint">
+          <kbd>a</kbd> accept · <kbd>r</kbd> reject · <kbd>A</kbd> accept all · <kbd>R</kbd> reject all
+        </div>
+      </div>
     </div>
   );
 }

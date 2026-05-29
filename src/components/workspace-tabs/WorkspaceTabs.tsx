@@ -1,13 +1,14 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import type { Workspace } from "../../lib/acp-events";
 
-type WsKind = "workspace" | "library" | "ide";
+type WsKind = "workspace" | "library" | "ide" | "terminal";
 
 interface Props {
   workspaces: Workspace[];
   activeId: string | null;
   libraryIds: Set<string>;
   editorIds: Set<string>;
+  terminalIds: Set<string>;
   onSelect: (id: string) => void;
   onCreate: () => void;
   onClose: (id: string) => void;
@@ -15,7 +16,8 @@ interface Props {
   onSelectFolder: (workspaceId: string) => void;
 }
 
-function wsKind(id: string, libIds: Set<string>, edIds: Set<string>): WsKind {
+function wsKind(id: string, libIds: Set<string>, edIds: Set<string>, termIds: Set<string>): WsKind {
+  if (termIds.has(id)) return "terminal";
   if (libIds.has(id)) return "library";
   if (edIds.has(id)) return "ide";
   return "workspace";
@@ -23,6 +25,7 @@ function wsKind(id: string, libIds: Set<string>, edIds: Set<string>): WsKind {
 
 function wsIcon(kind: WsKind): string {
   switch (kind) {
+    case "terminal": return "$_";
     case "library": return "📖";
     case "ide": return "⟨⟩";
     default: return ">_";
@@ -40,7 +43,7 @@ function shortenPath(p: string): string {
   return p;
 }
 
-export function WorkspaceTabs({ workspaces, activeId, libraryIds, editorIds, onSelect, onCreate, onClose, onRename, onSelectFolder }: Props) {
+export function WorkspaceTabs({ workspaces, activeId, libraryIds, editorIds, terminalIds, onSelect, onCreate, onClose, onRename, onSelectFolder }: Props) {
   const activeWs = workspaces.find((w) => w.id === activeId);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -94,7 +97,7 @@ export function WorkspaceTabs({ workspaces, activeId, libraryIds, editorIds, onS
             ) : (
               <>
                 <span className="tab-idx">[{String(i + 1).padStart(2, "0")}]</span>
-                <span className="tab-kind">{wsIcon(wsKind(ws.id, libraryIds, editorIds))}</span>
+                <span className="tab-kind">{wsIcon(wsKind(ws.id, libraryIds, editorIds, terminalIds))}</span>
                 <span
                   style={{ maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                   onDoubleClick={(e) => {

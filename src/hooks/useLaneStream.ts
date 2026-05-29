@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { LaneEvent, LaneStatus } from "../lib/acp-events";
 import { harnessStatusToDbStatus } from "../lib/acp-events";
 import type { AcpClient } from "../lib/acp-client";
-import type { AcpEvent, HarnessLaneStatus } from "../lib/acp-types";
+import type { AcpEvent, HarnessLaneStatus, PlanEntry } from "../lib/acp-types";
 
 function shortToolName(title?: string, kind?: string, toolCallId?: string): string {
   if (title) return title;
@@ -45,6 +45,7 @@ function acpEventToLaneEvent(
           kind: acpEvent.call.kind,
           status: acpEvent.call.status,
           input: acpEvent.call.rawInput,
+          content: acpEvent.call.content,
         },
       };
     }
@@ -173,7 +174,197 @@ const BUSY_STATUSES: ReadonlySet<HarnessLaneStatus> = new Set([
   "awaiting_peer",
 ]);
 
+// ─── Module-level per-lane plan store (Spec: ACP plan events) ─────
+
+const lanePlans = new Map<string, PlanEntry[]>();
+const LANE_PLAN_SIGNAL = "alizode:lane-plan";
+
+function setLanePlan(key: string, entries: PlanEntry[]): void {
+  lanePlans.set(key, entries);
+  window.dispatchEvent(new CustomEvent(LANE_PLAN_SIGNAL, { detail: key }));
+}
+
+export function getLanePlan(workspaceId: string, laneId: string): PlanEntry[] {
+  return lanePlans.get(`${workspaceId}:${laneId}`) ?? [];
+}
+
+/** Subscribe to a single lane's latest plan entries, re-rendering on update. */
+export function useLanePlan(
+  workspaceId: string | null | undefined,
+  laneId: string | null,
+): PlanEntry[] {
+  const [, setTick] = useState(0);
+  const key = workspaceId && laneId ? `${workspaceId}:${laneId}` : null;
+  useEffect(() => {
+    if (!key) return;
+    const handler = (e: Event) => {
+      if ((e as CustomEvent).detail === key) setTick((t) => t + 1);
+    };
+    window.addEventListener(LANE_PLAN_SIGNAL, handler);
+    return () => window.removeEventListener(LANE_PLAN_SIGNAL, handler);
+  }, [key]);
+  return key ? (lanePlans.get(key) ?? []) : [];
+}
+
+/** Subscribe to a single lane's transcript + status, re-rendering on any update.
+ *  Used by the Meeting Room to show the focused member's conversation. */
+export function useLaneTranscript(
+  workspaceId: string | null | undefined,
+  laneId: string | null,
+): { events: LaneEvent[]; status: HarnessLaneStatus } {
+  const [, setTick] = useState(0);
+  const key = workspaceId && laneId ? `${workspaceId}:${laneId}` : null;
+
+  useEffect(() => {
+    if (!key) return;
+    const onEvent = (e: Event) => {
+      if ((e as CustomEvent).detail === key) setTick((t) => t + 1);
+    };
+    const onStatus = (e: Event) => {
+      if ((e as CustomEvent).detail?.key === key) setTick((t) => t + 1);
+    };
+    window.addEventListener(LANE_EVENT_SIGNAL, onEvent);
+    window.addEventListener(LANE_STATUS_SIGNAL, onStatus);
+    return () => {
+      window.removeEventListener(LANE_EVENT_SIGNAL, onEvent);
+      window.removeEventListener(LANE_STATUS_SIGNAL, onStatus);
+    };
+  }, [key]);
+
+  // Hydrate from DB if this lane has no in-memory events yet.
+  useEffect(() => {
+    if (!key || !workspaceId || !laneId) return;
+    if ((allEvents.get(key) ?? []).length > 0) return;
+    invoke<LaneEvent[]>("lane_events", { workspaceId, laneId }).then((stored) => {
+      if ((allEvents.get(key) ?? []).length === 0 && stored.length > 0) {
+        allEvents.set(key, stored);
+        window.dispatchEvent(new CustomEvent(LANE_EVENT_SIGNAL, { detail: key }));
+      }
+    }).catch(() => {});
+  }, [key, workspaceId, laneId]);
+
+  return { events: getEvents(key), status: getLaneStatus(key) };
+}
+
+const BUSY_KINDS: ReadonlySet<HarnessLaneStatus> = new Set([
+  "starting",
+  "busy",
+  "needs_permission",
+  "awaiting_peer",
+]);
+
+function lastToolName(events: LaneEvent[]): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.kind === "ToolCall") {
+      const t = e.payload?.tool ?? e.payload?.name;
+      return typeof t === "string" ? t : "tool";
+    }
+    // A later text/result chunk means the tool phase is over.
+    if (e.kind === "AgentText" || e.kind === "ToolResult") return null;
+  }
+  return null;
+}
+
+/**
+ * Live activity for a lane: its status and the tool it is currently running
+ * (only while busy). Re-renders on status and event updates.
+ */
+export function useLaneActivity(
+  workspaceId: string | null | undefined,
+  laneId: string | null,
+): { status: HarnessLaneStatus; busy: boolean; tool: string | null } {
+  const [, setTick] = useState(0);
+  const key = workspaceId && laneId ? `${workspaceId}:${laneId}` : null;
+  useEffect(() => {
+    if (!key) return;
+    const onEvent = (e: Event) => {
+      if ((e as CustomEvent).detail === key) setTick((t) => t + 1);
+    };
+    const onStatus = (e: Event) => {
+      if ((e as CustomEvent).detail?.key === key) setTick((t) => t + 1);
+    };
+    window.addEventListener(LANE_EVENT_SIGNAL, onEvent);
+    window.addEventListener(LANE_STATUS_SIGNAL, onStatus);
+    return () => {
+      window.removeEventListener(LANE_EVENT_SIGNAL, onEvent);
+      window.removeEventListener(LANE_STATUS_SIGNAL, onStatus);
+    };
+  }, [key]);
+  const status = getLaneStatus(key);
+  const busy = BUSY_KINDS.has(status);
+  const tool = busy ? lastToolName(getEvents(key)) : null;
+  return { status, busy, tool };
+}
+
+function laneLastAgentLine(key: string): { text: string; seq: number } | null {
+  const evs = getEvents(key);
+  let end = -1;
+  for (let j = evs.length - 1; j >= 0; j--) {
+    if (evs[j].kind === "AgentText") { end = j; break; }
+  }
+  if (end < 0) return null;
+  let start = end;
+  while (start - 1 >= 0 && evs[start - 1].kind === "AgentText") start -= 1;
+  let text = "";
+  for (let j = start; j <= end; j++) {
+    const t = evs[j].payload?.text;
+    if (typeof t === "string") text += t;
+  }
+  const trimmed = text.trim();
+  return trimmed ? { text: trimmed, seq: evs[end].seq } : null;
+}
+
+/**
+ * Spotlight: the single most-recent agent line across the given team lanes,
+ * plus whether that speaker is currently busy. Re-renders on any lane update.
+ */
+export function useTeamSpotlight(
+  workspaceId: string | null | undefined,
+  laneIds: string[],
+): { laneId: string; text: string; busy: boolean } | null {
+  const [, setTick] = useState(0);
+  const idsKey = laneIds.join(",");
+  useEffect(() => {
+    const bump = () => setTick((t) => t + 1);
+    window.addEventListener(LANE_EVENT_SIGNAL, bump);
+    window.addEventListener(LANE_STATUS_SIGNAL, bump);
+    return () => {
+      window.removeEventListener(LANE_EVENT_SIGNAL, bump);
+      window.removeEventListener(LANE_STATUS_SIGNAL, bump);
+    };
+  }, []);
+  void idsKey;
+  if (!workspaceId) return null;
+  let best: { laneId: string; text: string; seq: number } | null = null;
+  for (const laneId of laneIds) {
+    const line = laneLastAgentLine(`${workspaceId}:${laneId}`);
+    if (line && (!best || line.seq > best.seq)) {
+      best = { laneId, text: line.text, seq: line.seq };
+    }
+  }
+  if (!best) return null;
+  return {
+    laneId: best.laneId,
+    text: best.text,
+    busy: BUSY_KINDS.has(getLaneStatus(`${workspaceId}:${best.laneId}`)),
+  };
+}
+
 // ─── Public helpers ───────────────────────────────────────────────
+
+export function pushUserEvent(workspaceId: string, laneId: string, text: string) {
+  const key = `${workspaceId}:${laneId}`;
+  pushEvent(key, {
+    workspace_id: workspaceId,
+    lane_id: laneId,
+    seq: Date.now(),
+    ts: Date.now(),
+    kind: "UserIn",
+    payload: { text },
+  });
+  window.dispatchEvent(new CustomEvent(LANE_EVENT_SIGNAL, { detail: key }));
+}
 
 export function pushSystemEvent(workspaceId: string, laneId: string, text: string) {
   const key = `${workspaceId}:${laneId}`;
@@ -206,6 +397,65 @@ export function pushPeerEvent(
     payload: { from_lane: fromLane, to_lane: toLane, text },
   });
   window.dispatchEvent(new CustomEvent(LANE_EVENT_SIGNAL, { detail: key }));
+}
+
+// ─── Global per-lane stream capture ──────────────────────────────
+// Every spawned lane's events are captured here, regardless of which lane is
+// active/focused. This is what lets a non-active team member's replies and
+// status land in its transcript (the Meeting Room shows lanes that aren't the
+// active lane). Set up once per client in spawnClientForLane.
+
+const DRAIN_ACTION_SIGNAL = "alizode:drain-action";
+
+export function attachClientStream(
+  client: AcpClient,
+  workspaceId: string,
+  laneId: string,
+): () => void {
+  const key = `${workspaceId}:${laneId}`;
+  return client.onEvent((acpEvent: AcpEvent) => {
+    if (acpEvent.type === "stop") {
+      setHarnessLaneStatus(workspaceId, laneId, "idle");
+      invoke<string | null>("inter_lane_on_stop", { laneId })
+        .then((nextStatus) => {
+          if (!nextStatus) return;
+          invoke<DrainAction | null>("inter_lane_set_status", { laneId, status: nextStatus })
+            .then((drain) => {
+              if (drain) {
+                window.dispatchEvent(new CustomEvent(DRAIN_ACTION_SIGNAL, { detail: drain }));
+              }
+            })
+            .catch(() => {});
+        })
+        .catch(() => {});
+    }
+    if (acpEvent.type === "error") setHarnessLaneStatus(workspaceId, laneId, "error");
+    if (acpEvent.type === "permission_request") {
+      setHarnessLaneStatus(workspaceId, laneId, "needs_permission");
+    }
+    if (acpEvent.type === "plan") setLanePlan(key, acpEvent.entries);
+    if (
+      acpEvent.type === "message_chunk" ||
+      acpEvent.type === "thought_chunk" ||
+      acpEvent.type === "tool_call"
+    ) {
+      if (getLaneStatus(key) === "needs_permission") {
+        setHarnessLaneStatus(workspaceId, laneId, "busy");
+      }
+    }
+    const laneEvent = acpEventToLaneEvent(acpEvent, laneId, workspaceId);
+    if (laneEvent) {
+      pushEvent(key, laneEvent);
+      window.dispatchEvent(new CustomEvent(LANE_EVENT_SIGNAL, { detail: key }));
+    }
+  });
+}
+
+/** Subscribe to drain actions emitted when any lane goes idle with a pending inbox. */
+export function subscribeDrainActions(cb: (action: DrainAction) => void): () => void {
+  const handler = (e: Event) => cb((e as CustomEvent).detail as DrainAction);
+  window.addEventListener(DRAIN_ACTION_SIGNAL, handler);
+  return () => window.removeEventListener(DRAIN_ACTION_SIGNAL, handler);
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────
@@ -294,51 +544,11 @@ export function useLaneStream(
     setRenderTick((t) => t + 1);
   }, [cacheKey, laneId, workspaceId]);
 
-  // ACP event subscription
-  useEffect(() => {
-    if (!client || !laneId || !cacheKey) return;
-    const boundKey = cacheKey;
-    const boundLaneId = laneId;
-    const boundWsId = workspaceId ?? "";
-
-    const unsub = client.onEvent((acpEvent: AcpEvent) => {
-      if (acpEvent.type === 'stop') {
-        setHarnessLaneStatus(boundWsId, boundLaneId, "idle");
-        invoke<string | null>("inter_lane_on_stop", { laneId: boundLaneId }).then((nextStatus) => {
-          if (nextStatus) {
-            invoke<DrainAction | null>("inter_lane_set_status", { laneId: boundLaneId, status: nextStatus }).then((drain) => {
-              if (drain && onDrainAction) {
-                onDrainAction(drain);
-              }
-            }).catch(() => {});
-          }
-        }).catch(() => {});
-      }
-      if (acpEvent.type === 'error') {
-        setHarnessLaneStatus(boundWsId, boundLaneId, "error");
-      }
-      if (acpEvent.type === 'permission_request') {
-        setHarnessLaneStatus(boundWsId, boundLaneId, "needs_permission");
-      }
-      if (
-        acpEvent.type === 'message_chunk' ||
-        acpEvent.type === 'thought_chunk' ||
-        acpEvent.type === 'tool_call'
-      ) {
-        const current = getLaneStatus(boundKey);
-        if (current === "needs_permission") {
-          setHarnessLaneStatus(boundWsId, boundLaneId, "busy");
-        }
-      }
-
-      const laneEvent = acpEventToLaneEvent(acpEvent, boundLaneId, boundWsId);
-      if (laneEvent) {
-        pushEvent(boundKey, laneEvent);
-        setRenderTick((t) => t + 1);
-      }
-    });
-    return unsub;
-  }, [client, laneId, workspaceId, cacheKey, onDrainAction]);
+  // Per-lane event capture now lives in attachClientStream (set up globally
+  // per client in spawnClientForLane), so non-active lanes are captured too.
+  // `client` / `onDrainAction` are retained in the signature for compatibility.
+  void client;
+  void onDrainAction;
 
   const addUserInput = useCallback(
     (text: string) => {

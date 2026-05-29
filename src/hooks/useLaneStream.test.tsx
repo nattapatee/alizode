@@ -1,6 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useLaneStream } from "./useLaneStream";
+import { useLaneStream, attachClientStream } from "./useLaneStream";
 import type { AcpEvent } from "../lib/acp-types";
 
 const invokeMock = vi.fn();
@@ -43,6 +43,12 @@ describe("useLaneStream", () => {
     const { result } = renderHook(() =>
       useLaneStream("lane-1", "ws-1", client as never, undefined, onLaneStatus),
     );
+
+    // Events are captured globally per client (as in spawnClientForLane),
+    // not by the hook directly.
+    act(() => {
+      attachClientStream(client as never, "ws-1", "lane-1");
+    });
 
     act(() => {
       result.current.addUserInput("hello");

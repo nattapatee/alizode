@@ -29,6 +29,7 @@ axum = "0.8"
 anyhow = "1"
 log = "0.4"
 libc = "0.2"
+portable-pty = "0.8"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

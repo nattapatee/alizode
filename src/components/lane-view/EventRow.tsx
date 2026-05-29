@@ -1,4 +1,7 @@
+import { useMemo } from "react";
+import { diffLines } from "diff";
 import type { LaneEvent } from "../../lib/acp-events";
+import type { ToolCallContent } from "../../lib/acp-types";
 import {
   getEventText,
   getToolName,
@@ -9,6 +12,55 @@ import {
   getPermInfo,
 } from "../../lib/acp-events";
 import { formatTimestamp } from "../../lib/format";
+import { openFullDiff } from "../full-diff-modal/FullDiffModal";
+
+const INLINE_DIFF_CAP = 8;
+
+interface InlineDiffLine { kind: "add" | "del"; text: string }
+
+function extractInlineDiff(payload: Record<string, unknown>): { path: string; lines: InlineDiffLine[]; total: number } | null {
+  const content = payload.content as ToolCallContent[] | undefined;
+  if (!Array.isArray(content)) return null;
+  const dc = content.find((c) => c.type === "diff");
+  if (!dc?.path) return null;
+  const oldText = (dc.oldText as string) ?? "";
+  const newText = (dc.newText as string) ?? "";
+  if (!oldText && !newText) return null;
+  const parts = diffLines(oldText, newText);
+  const lines: InlineDiffLine[] = [];
+  for (const p of parts) {
+    if (!p.added && !p.removed) continue;
+    const raw = p.value.endsWith("\n") ? p.value.slice(0, -1) : p.value;
+    const kind: "add" | "del" = p.added ? "add" : "del";
+    for (const text of raw.split("\n")) lines.push({ kind, text });
+  }
+  return { path: dc.path, lines: lines.slice(0, INLINE_DIFF_CAP), total: lines.length };
+}
+
+function InlineDiffPreview({ payload }: { payload: Record<string, unknown> }) {
+  const diff = useMemo(() => extractInlineDiff(payload), [payload]);
+  if (!diff || diff.lines.length === 0) return null;
+  const handleClick = () => {
+    const content = payload.content as ToolCallContent[] | undefined;
+    const dc = content?.find((c) => c.type === "diff");
+    if (dc?.path) {
+      openFullDiff(dc.path, (dc.oldText as string) ?? "", (dc.newText as string) ?? "");
+    }
+  };
+  return (
+    <div className="log-inline-diff" onClick={handleClick} role="button" tabIndex={0}>
+      {diff.lines.map((ln, i) => (
+        <div key={i} className={`log-idiff-line log-idiff-${ln.kind}`}>
+          <span className="log-idiff-sign">{ln.kind === "add" ? "+" : "−"}</span>
+          <span className="log-idiff-text">{ln.text}</span>
+        </div>
+      ))}
+      {diff.total > INLINE_DIFF_CAP && (
+        <div className="log-idiff-more">… {diff.total - INLINE_DIFF_CAP} more · click for full diff</div>
+      )}
+    </div>
+  );
+}
 
 interface Props {
   event: LaneEvent;
@@ -55,6 +107,7 @@ function ToolCallRow({ event }: Props) {
       {input && input.length > 80 && (
         <pre className="log-expand">{input}</pre>
       )}
+      <InlineDiffPreview payload={event.payload} />
     </details>
   );
 }

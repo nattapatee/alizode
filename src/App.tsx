@@ -7,10 +7,12 @@ import { LaneList } from "./components/lane-list/LaneList";
 import { LaneView } from "./components/lane-view/LaneView";
 import { LibraryView } from "./components/library-view/LibraryView";
 import { EditorView } from "./components/editor-view/EditorView";
+import { TerminalView } from "./components/terminal-view/TerminalView";
 import { CommandBar } from "./components/command-bar/CommandBar";
 import { StatusBar } from "./components/status-bar/StatusBar";
 import { PermissionModal } from "./components/permission-modal/PermissionModal";
 import { FsWriteModal } from "./components/fs-write-modal/FsWriteModal";
+import { FullDiffModal } from "./components/full-diff-modal/FullDiffModal";
 import { PeerToast } from "./components/peer-toast/PeerToast";
 import { Onboarding } from "./components/onboarding/Onboarding";
 import { Stage } from "./components/stage/Stage";
@@ -21,10 +23,15 @@ import { ConfigPicker } from "./components/config-picker/ConfigPicker";
 import type { AcpConfigOption } from "./lib/acp-types";
 import { SessionPicker } from "./components/session-picker/SessionPicker";
 import { AgentPicker } from "./components/agent-picker/AgentPicker";
+import { TeamBuilder } from "./components/team-builder/TeamBuilder";
+import { MeetingRoom } from "./components/meeting-room/MeetingRoom";
+import type { SpawnPayload } from "./components/team-builder/TeamBuilder";
+import type { TeamPresetWithMembers, CreateTeamInput, Lane } from "./lib/acp-events";
+import { buildTeamContext } from "./lib/team-context";
 import { CHAR_BY_ID } from "./lib/characters";
 import { getActiveThoughtText } from "./lib/acp-events";
 import { useWorkspace } from "./hooks/useWorkspace";
-import { useLaneStream, pushPeerEvent, pushSystemEvent, setHarnessLaneStatus } from "./hooks/useLaneStream";
+import { useLaneStream, pushPeerEvent, pushSystemEvent, pushUserEvent, setHarnessLaneStatus } from "./hooks/useLaneStream";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useHarnessCoordinator } from "./hooks/useHarnessCoordinator";
 
@@ -49,6 +56,11 @@ export default function App() {
     renameWorkspace,
     updateWorkspaceCwd,
     refreshLanes,
+    teams,
+    teamPresets,
+    spawnTeam,
+    deleteTeam,
+    deleteTeamPreset,
   } = useWorkspace();
 
   useHarnessCoordinator(getOrSpawnClient, lanes);
@@ -107,9 +119,13 @@ export default function App() {
   const [configPickerOption, setConfigPickerOption] = useState<AcpConfigOption | null>(null);
   const [libraryWorkspaces, setLibraryWorkspaces] = useState<Set<string>>(new Set());
   const [editorWorkspaces, setEditorWorkspaces] = useState<Set<string>>(new Set());
+  const [terminalWorkspaces, setTerminalWorkspaces] = useState<Set<string>>(new Set());
   const [introShown, setIntroShown] = useState<Set<string>>(new Set());
   const [showCreateMenu, setShowCreateMenu] = useState(false);
   const [showAgentPicker, setShowAgentPicker] = useState(false);
+  const [showTeamBuilder, setShowTeamBuilder] = useState(false);
+  const [activeTeamId, setActiveTeamId] = useState<string | null>(null);
+  const [focusedTeamLaneId, setFocusedTeamLaneId] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState<"stage" | "bus">("stage");
   const [peerMsgCount, setPeerMsgCount] = useState(0);
 
@@ -125,6 +141,7 @@ export default function App() {
 
   const isLibrary = activeWorkspaceId ? libraryWorkspaces.has(activeWorkspaceId) : false;
   const isEditor = activeWorkspaceId ? editorWorkspaces.has(activeWorkspaceId) : false;
+  const isTerminal = activeWorkspaceId ? terminalWorkspaces.has(activeWorkspaceId) : false;
 
   const handleCancelLane = useCallback(async () => {
     if (!activeLaneId) return;
@@ -199,6 +216,7 @@ export default function App() {
   }, []);
 
   const pendingAgentRef = useRef<string | null>(null);
+  const seededTeamLanes = useRef<Set<string>>(new Set());
 
   const handleAgentPicked = useCallback(async (agentId: string) => {
     setShowAgentPicker(false);
@@ -225,6 +243,118 @@ export default function App() {
     const ws = await createWorkspace("ide", "");
     setEditorWorkspaces((prev) => new Set([...prev, ws.id]));
   }, [createWorkspace]);
+
+  const handleCreateTerminal = useCallback(async () => {
+    setShowCreateMenu(false);
+    const ws = await createWorkspace("terminal", "~");
+    setTerminalWorkspaces((prev) => new Set([...prev, ws.id]));
+  }, [createWorkspace]);
+
+  const handleSelectTeam = useCallback(
+    (teamId: string) => {
+      setActiveTeamId(teamId);
+      setFocusedTeamLaneId(null);
+      const leader = lanes.find((l) => l.team_id === teamId && l.is_leader);
+      if (leader) setActiveLaneId(leader.id);
+    },
+    [lanes, setActiveLaneId],
+  );
+
+  const handleSelectLaneClearTeam = useCallback(
+    (laneId: string) => {
+      setActiveTeamId(null);
+      setActiveLaneId(laneId);
+    },
+    [setActiveLaneId],
+  );
+
+  const handleTeamSend = useCallback(
+    async (laneId: string, text: string) => {
+      const client = await getOrSpawnClient(laneId);
+      if (!client) {
+        addSystemEvent("error: could not spawn agent for team member");
+        return;
+      }
+      const wsId = activeWorkspaceId ?? "";
+
+      // Phase 6: inject team/role context once per lane so the leader knows
+      // to delegate (via peer_send / team_info) and members know their role.
+      let outgoing = text;
+      const lane = lanes.find((l) => l.id === laneId);
+      if (lane?.team_id && !seededTeamLanes.current.has(laneId)) {
+        seededTeamLanes.current.add(laneId);
+        const team = teams.find((t) => t.id === lane.team_id);
+        const members = lanes
+          .filter((l) => l.team_id === lane.team_id)
+          .sort((a, b) => a.team_sort_order - b.team_sort_order);
+        const leaderLane = members.find((l) => l.is_leader);
+        const roster = members
+          .map((l) => `- ${l.id} (${l.directive}${l.is_leader ? ", leader" : ""})`)
+          .join("\n");
+        const preamble = buildTeamContext({
+          isLeader: lane.is_leader,
+          role: lane.directive,
+          team: team?.name ?? lane.team_id ?? "team",
+          leader: leaderLane?.id ?? "unknown",
+          roster,
+          laneId,
+        });
+        outgoing = preamble + text;
+      }
+
+      pushUserEvent(wsId, laneId, text);
+      setHarnessLaneStatus(wsId, laneId, "busy");
+      await invoke("inter_lane_set_status", { laneId, status: "busy" }).catch(() => {});
+      try {
+        await client.prompt([{ type: "text", text: outgoing }]);
+      } catch (err) {
+        setHarnessLaneStatus(wsId, laneId, "error");
+        pushSystemEvent(wsId, laneId, `prompt error: ${String(err)}`);
+      }
+    },
+    [getOrSpawnClient, activeWorkspaceId, addSystemEvent, lanes, teams],
+  );
+
+  const handleCreateTeam = useCallback(() => {
+    setShowCreateMenu(false);
+    setShowTeamBuilder(true);
+  }, []);
+
+  const handleSpawnTeamPayload = useCallback(
+    async (payload: SpawnPayload) => {
+      if (!activeWorkspaceId || !activeWorkspace) return;
+      const input: CreateTeamInput = {
+        workspace_id: activeWorkspaceId,
+        name: payload.name,
+        cwd: activeWorkspace.cwd,
+        members: payload.members,
+        save_as_preset: payload.saveAsPreset,
+      };
+      await spawnTeam(input);
+    },
+    [activeWorkspaceId, activeWorkspace, spawnTeam],
+  );
+
+  const handleSpawnPreset = useCallback(
+    async (preset: TeamPresetWithMembers) => {
+      if (!activeWorkspaceId || !activeWorkspace) return;
+      const input: CreateTeamInput = {
+        workspace_id: activeWorkspaceId,
+        name: preset.preset.name,
+        cwd: activeWorkspace.cwd,
+        members: preset.members.map((m, i) => ({
+          agent_kind: m.agent_kind,
+          model: m.model,
+          directive: m.directive,
+          is_leader: m.is_leader,
+          sort_order: i,
+        })),
+        save_as_preset: false,
+      };
+      await spawnTeam(input);
+    },
+    [activeWorkspaceId, activeWorkspace, spawnTeam],
+  );
 
   const handleLibraryFolderSelect = useCallback(
     async (path: string) => {
@@ -255,9 +385,17 @@ export default function App() {
 
   const handleCloseWorkspace = useCallback(
     async (id: string) => {
+      if (terminalWorkspaces.has(id)) {
+        await invoke("terminal_kill", { id }).catch(() => {});
+        setTerminalWorkspaces((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
       await deleteWorkspace(id);
     },
-    [deleteWorkspace],
+    [deleteWorkspace, terminalWorkspaces],
   );
 
   const handleSelectFolder = useCallback(
@@ -293,7 +431,16 @@ export default function App() {
         if (spaceIdx > 1) {
           const mentionedLane = text.slice(1, spaceIdx);
           const message = text.slice(spaceIdx + 1).trim();
-          const target = lanes.find((l) => l.id === mentionedLane);
+          // @leader resolves to the leader of the sender's team.
+          let target: Lane | undefined;
+          if (mentionedLane === "leader") {
+            const me = lanes.find((l) => l.id === activeLaneId);
+            target = me?.team_id
+              ? lanes.find((l) => l.team_id === me.team_id && l.is_leader)
+              : undefined;
+          } else {
+            target = lanes.find((l) => l.id === mentionedLane);
+          }
           if (target && message) {
             addSystemEvent(`→ @${mentionedLane}: ${message}`);
             try {
@@ -464,6 +611,7 @@ export default function App() {
         activeId={activeWorkspaceId}
         libraryIds={libraryWorkspaces}
         editorIds={editorWorkspaces}
+        terminalIds={terminalWorkspaces}
         onSelect={setActiveWorkspaceId}
         onCreate={handleCreateWorkspace}
         onClose={handleCloseWorkspace}
@@ -471,7 +619,9 @@ export default function App() {
         onSelectFolder={handleSelectFolder}
       />
 
-      {isEditor && activeWorkspace ? (
+      {isTerminal && activeWorkspace ? (
+        <TerminalView terminalId={activeWorkspace.id} cwd={activeWorkspace.cwd} />
+      ) : isEditor && activeWorkspace ? (
         <EditorView rootPath={activeWorkspace.cwd} onSelectFolder={handleEditorFolderSelect} />
       ) : isLibrary && activeWorkspace ? (
         <LibraryView rootPath={activeWorkspace.cwd} onSelectFolder={handleLibraryFolderSelect} />
@@ -490,11 +640,26 @@ export default function App() {
           })()}
           <LaneList
             lanes={lanes}
+            teams={teams}
             activeId={activeLaneId}
-            onSelect={setActiveLaneId}
+            onSelect={handleSelectLaneClearTeam}
             onCreate={handleCreateLane}
             onDelete={handleDeleteLane}
+            onSelectTeam={handleSelectTeam}
+            onDeleteTeam={deleteTeam}
+            onCreateTeam={handleCreateTeam}
           />
+          {activeTeamId && teams.find((t) => t.id === activeTeamId) ? (
+            <MeetingRoom
+              team={teams.find((t) => t.id === activeTeamId)!}
+              lanes={lanes.filter((l) => l.team_id === activeTeamId)}
+              workspaceId={activeWorkspaceId}
+              focusedLaneId={focusedTeamLaneId}
+              onFocusLane={setFocusedTeamLaneId}
+              onSend={handleTeamSend}
+            />
+          ) : (
+          <>
           <main className="chat">
             <LaneView
               lane={activeLane}
@@ -556,12 +721,15 @@ export default function App() {
               <PeerBus lanes={lanes} activeLaneId={activeLaneId} />
             )}
           </aside>
+          </>
+          )}
         </div>
       )}
 
       <StatusBar workspace={activeWorkspace} lanes={lanes} />
       <PermissionModal client={activeClient} />
       <FsWriteModal client={activeClient} />
+      <FullDiffModal />
       <PeerToast />
       {showModelPicker && (
         <ModelPicker
@@ -592,6 +760,14 @@ export default function App() {
           onCancel={() => setShowAgentPicker(false)}
         />
       )}
+      <TeamBuilder
+        open={showTeamBuilder}
+        onClose={() => setShowTeamBuilder(false)}
+        onSpawn={handleSpawnTeamPayload}
+        presets={teamPresets}
+        onSpawnPreset={handleSpawnPreset}
+        onDeletePreset={deleteTeamPreset}
+      />
       {showCreateMenu && (
         <div className="newtab-overlay" onClick={() => setShowCreateMenu(false)}>
           <div className="newtab-menu" onClick={(e) => e.stopPropagation()}>
@@ -615,6 +791,13 @@ export default function App() {
               <span className="opt-meta">
                 <span className="opt-name">ide</span>
                 <span className="opt-sub">file tree · code · forge chat</span>
+              </span>
+            </button>
+            <button className="newtab-opt" onClick={handleCreateTerminal}>
+              <span className="opt-glyph">$_</span>
+              <span className="opt-meta">
+                <span className="opt-name">terminal</span>
+                <span className="opt-sub">shell · commands · full pty</span>
               </span>
             </button>
           </div>

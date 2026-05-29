@@ -53,6 +53,10 @@ export class AcpClient {
   private listeners: Array<(e: AcpEvent) => void> = [];
   private disposed = false;
   dead = false;
+  // Serializes prompts: an ACP session is one conversation, so two overlapping
+  // prompt() calls corrupt it (e.g. Anthropic "thinking blocks ... cannot be
+  // modified"). Each prompt awaits the previous one before issuing acp_prompt.
+  private promptTail: Promise<unknown> = Promise.resolve();
   configOptions: AcpConfigOption[] = [];
   modelInfo: AcpModelInfo | null = null;
 
@@ -151,6 +155,15 @@ export class AcpClient {
   }
 
   async prompt(blocks: ContentBlock[]): Promise<StopReason> {
+    // Chain after any in-flight prompt so a session never runs two turns at once.
+    const run = this.promptTail
+      .catch(() => {})
+      .then(() => this.promptInner(blocks));
+    this.promptTail = run.catch(() => {});
+    return run;
+  }
+
+  private async promptInner(blocks: ContentBlock[]): Promise<StopReason> {
     const result = await invoke<{ stopReason: StopReason; usage?: UsageInfo; _meta?: { usage?: UsageInfo } }>(
       'acp_prompt',
       { session: this.session, blocks },

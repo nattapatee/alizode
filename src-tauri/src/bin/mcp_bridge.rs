@@ -217,7 +217,12 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "peer_list",
-            "description": "List all active lanes in the workspace",
+            "description": "List all active lanes in the workspace (includes team_id, directive, is_leader)",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "team_info",
+            "description": "Get your team context: team name, your role/directive, whether you are the leader, and the full member roster.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
@@ -373,6 +378,10 @@ fn execute_tool(conn: &Connection, config: &Config, tool: &str, args: &Value) ->
         },
         "peer_list" => match list_lanes(conn, ws) {
             Ok(lanes) => tool_ok(&serde_json::to_string(&lanes).unwrap_or_default()),
+            Err(e) => tool_err(&e.to_string()),
+        },
+        "team_info" => match team_info(conn, ws, &config.lane_id) {
+            Ok(info) => tool_ok(&serde_json::to_string(&info).unwrap_or_default()),
             Err(e) => tool_err(&e.to_string()),
         },
         "peer_send" => peer_send(conn, config, arg_str(args, "target"), arg_str(args, "message")),
@@ -562,7 +571,8 @@ fn review_request_send(
 
 fn list_lanes(conn: &Connection, ws: &str) -> rusqlite::Result<Vec<Value>> {
     let mut stmt = conn.prepare(
-        "SELECT id,agent_kind,model,status,is_main FROM lanes WHERE workspace_id=?1 ORDER BY created_at",
+        "SELECT id,agent_kind,model,status,is_main,team_id,directive,is_leader,team_sort_order \
+         FROM lanes WHERE workspace_id=?1 ORDER BY created_at",
     )?;
     let rows = stmt.query_map([ws], |row| {
         Ok(json!({
@@ -571,9 +581,72 @@ fn list_lanes(conn: &Connection, ws: &str) -> rusqlite::Result<Vec<Value>> {
             "model": row.get::<_,String>(2)?,
             "status": row.get::<_,String>(3)?,
             "is_main": row.get::<_,i32>(4)? != 0,
+            "team_id": row.get::<_,Option<String>>(5)?,
+            "directive": row.get::<_,String>(6)?,
+            "is_leader": row.get::<_,i32>(7)? != 0,
+            "team_sort_order": row.get::<_,i32>(8)?,
         }))
     })?;
     rows.collect()
+}
+
+fn team_info(conn: &Connection, ws: &str, lane_id: &str) -> rusqlite::Result<Value> {
+    // Find this lane's team.
+    let team_id: Option<String> = conn
+        .query_row(
+            "SELECT team_id FROM lanes WHERE id=?1 AND workspace_id=?2",
+            (lane_id, ws),
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap_or(None);
+
+    let Some(team_id) = team_id else {
+        return Ok(json!({ "in_team": false }));
+    };
+
+    let team_name: String = conn
+        .query_row(
+            "SELECT name FROM teams WHERE id=?1",
+            [&team_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default();
+
+    let mut stmt = conn.prepare(
+        "SELECT id,agent_kind,directive,is_leader,status FROM lanes \
+         WHERE team_id=?1 ORDER BY team_sort_order",
+    )?;
+    let members: Vec<Value> = stmt
+        .query_map([&team_id], |row| {
+            Ok(json!({
+                "id": row.get::<_,String>(0)?,
+                "agent_kind": row.get::<_,String>(1)?,
+                "directive": row.get::<_,String>(2)?,
+                "is_leader": row.get::<_,i32>(3)? != 0,
+                "status": row.get::<_,String>(4)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<Value>>>()?;
+
+    let me = members.iter().find(|m| m["id"] == json!(lane_id));
+    let my_role = me.map(|m| m["directive"].clone()).unwrap_or(Value::Null);
+    let am_leader = me.map(|m| m["is_leader"] == json!(true)).unwrap_or(false);
+    let leader_id = members
+        .iter()
+        .find(|m| m["is_leader"] == json!(true))
+        .map(|m| m["id"].clone())
+        .unwrap_or(Value::Null);
+
+    Ok(json!({
+        "in_team": true,
+        "team_id": team_id,
+        "team_name": team_name,
+        "your_lane_id": lane_id,
+        "your_role": my_role,
+        "you_are_leader": am_leader,
+        "leader_lane_id": leader_id,
+        "members": members,
+    }))
 }
 
 fn list_memory(conn: &Connection, ws: &str, ns: &str) -> rusqlite::Result<Vec<Value>> {

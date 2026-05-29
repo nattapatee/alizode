@@ -48,6 +48,60 @@ export interface Lane {
   status: LaneStatus;
   cwd: string;
   created_at: number;
+  team_id: string | null;
+  directive: string;
+  is_leader: boolean;
+  team_sort_order: number;
+}
+
+export interface Team {
+  id: string;
+  workspace_id: string;
+  name: string;
+  preset_id: string | null;
+  created_at: number;
+}
+
+export interface TeamPreset {
+  id: string;
+  name: string;
+  created_at: number;
+}
+
+export interface TeamPresetMember {
+  id: string;
+  preset_id: string;
+  agent_kind: string;
+  model: string;
+  directive: string;
+  is_leader: boolean;
+  sort_order: number;
+}
+
+export interface TeamPresetWithMembers {
+  preset: TeamPreset;
+  members: TeamPresetMember[];
+}
+
+export interface CreateTeamMemberInput {
+  agent_kind: string;
+  model: string;
+  directive: string;
+  is_leader: boolean;
+  sort_order: number;
+}
+
+export interface CreateTeamInput {
+  workspace_id: string;
+  name: string;
+  cwd: string;
+  save_as_preset: boolean;
+  members: CreateTeamMemberInput[];
+}
+
+export interface CreateTeamResult {
+  team: Team;
+  lanes: Lane[];
 }
 
 export interface LaneEvent {

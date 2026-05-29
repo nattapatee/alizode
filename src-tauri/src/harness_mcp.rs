@@ -252,7 +252,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "peer_send",
-            "description": "Send a message to another lane and wait for their reply. Use peer_reply to respond to received messages.",
+            "description": "Send a message to another lane. Returns once the message is DELIVERED — it does NOT return the recipient's reply. The reply arrives later as a separate inbound message that will automatically resume your turn. After a successful peer_send you MUST end your turn and wait; do NOT call peer_send again to the same lane (that fails with peer_in_flight) and do NOT poll with peer_list.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
